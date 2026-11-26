@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>信匣 · 临时邮箱</title>
+<meta name="description" content="免注册的临时邮箱。生成地址，自动接收验证码与确认邮件，正文随时打开，内容一键复制。">
+<meta name="theme-color" content="#ffffff">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="site-head">
+  <div class="wrap head-inner">
+    <a class="brand" href="/" id="brandHome" aria-label="信匣首页">
+      <svg class="brand-mark" viewBox="0 0 30 30" role="img" aria-hidden="true">
+        <rect width="30" height="30" rx="7.5" fill="#2a574c"/>
+        <g fill="none" stroke="#f7f5f0" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="8" y="10.5" width="14" height="10.5" rx="2"/>
+          <path d="M8.4 12.2l6.05 3.9a1.2 1.2 0 0 0 1.3 0l6.05-3.9"/>
+        </g>
+      </svg>
+      <span class="brand-word">信匣<small>TEMP MAIL</small></span>
+    </a>
+    <button class="nav-account" id="openAdmin" type="button">
+      <svg class="nav-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="5" width="18" height="14" rx="2"/>
+        <path d="M3.6 7.2l7.7 5.2a1.3 1.3 0 0 0 1.4 0l7.7-5.2"/>
+      </svg>
+      <span class="nav-label">我的邮箱</span>
+      <span class="nav-sub">QQ / Gmail</span>
+    </button>
+  </div>
+</header>
+
+<main class="wrap" id="homeView">
+
+  <section class="hero">
+    <h1>临时邮箱，收完就走。</h1>
+    <div class="gen-row">
+      <label class="gen-pick gen-prov">
+        <span>服务商</span>
+        <select id="genProv" aria-label="临时邮箱服务商"></select>
+      </label>
+      <label class="gen-pick gen-prefix">
+        <span>前缀</span>
+        <input id="genPrefix" type="text" inputmode="latin" placeholder="留空随机" maxlength="24" spellcheck="false" autocomplete="off" aria-label="自定义前缀，可留空">
+      </label>
+      <button class="btn btn-primary btn-lg" id="mkTemp">创建邮箱</button>
+    </div>
+    <p class="gen-hint" id="prefixHint" hidden></p>
+  </section>
+
+  <section class="mailbox" id="mailbox" hidden>
+    <div class="addr-panel">
+      <div class="addr-top">
+        <span class="label">当前地址</span>
+        <span class="chip" id="provTag"></span>
+        <label class="switch-wrap" id="switchWrap" hidden>
+          <span>历史</span>
+          <select id="addrSwitch" aria-label="切换历史地址"></select>
+        </label>
+      </div>
+      <div class="addr-line">
+        <code id="curAddr"></code>
+        <button class="btn btn-outline" id="copyAddr">复制地址</button>
+        <button class="btn btn-quiet btn-del" id="delAddr" type="button">删除地址</button>
+      </div>
+    </div>
+
+    <div class="expired" id="expiredBox" hidden>
+      <div class="expired-txt">
+        <strong>这个地址已过期</strong>
+        <span>服务商收回了信箱，换一个继续收</span>
+      </div>
+      <button class="btn btn-rust" id="rebuild">换一个新地址</button>
+    </div>
+
+    <section class="inbox" id="inbox">
+      <div class="inbox-head">
+        <h2>收件箱</h2>
+        <span class="count" id="inboxCount">0 封</span>
+        <span class="status ok" id="liveTag"><i></i>自动收信中</span>
+        <span class="status warn" id="liveNote" hidden></span>
+        <button class="icon-btn" id="refreshNow" type="button" title="立即刷新" aria-label="立即刷新">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3.5 12a8.5 8.5 0 1 0 2.7-6.2"/>
+            <path d="M3.5 4.5v5h5"/>
+          </svg>
+        </button>
+      </div>
+      <div class="msg-list" id="msgList"></div>
+      <article class="reader" id="reader" hidden></article>
+    </section>
+  </section>
+
+  <section class="codes" id="codes" hidden>
+    <div class="codes-head">
+      <h2>我的邮箱验证码</h2>
+      <span class="count" id="codesCount"></span>
+    </div>
+    <div class="codes-list" id="codesList"></div>
+  </section>
+
+  <section class="start" id="start">
+    <h2>还没有临时邮箱</h2>
+  </section>
+
+</main>
+
+<main class="wrap account-page" id="accountView" hidden>
+
+  <div class="page-head">
+    <a class="page-back" id="backHome" href="#">← 临时邮箱</a>
+    <h1>我的邮箱</h1>
+    <p class="page-lede">接入自己的 QQ / Gmail，在这里收信、读信、复制验证码。</p>
+  </div>
+
+  <div class="account-grid">
+    <aside class="acc-side">
+      <div class="side-head">
+        <h2>已接入</h2>
+        <button class="btn btn-quiet" id="accAddToggle" type="button">添加邮箱</button>
+      </div>
+      <div class="acc-list" id="accList"></div>
+
+      <form class="acc-form" id="accForm" novalidate hidden>
+        <div class="fields">
+          <label>
+            <span>邮箱地址</span>
+            <input id="aEmail" placeholder="例如 you@example.com" spellcheck="false" autocomplete="off">
+          </label>
+          <label>
+            <span>服务商</span>
+            <select id="aProv">
+              <option value="qq">QQ 邮箱</option>
+              <option value="gmail">Gmail</option>
+            </select>
+          </label>
+          <label class="wide">
+            <span id="aPassLabel">授权码</span>
+            <input id="aPass" type="password" placeholder="16 位授权码，不是登录密码" spellcheck="false" autocomplete="off">
+          </label>
+        </div>
+        <p class="hint" id="aHint"></p>
+        <div class="form-foot">
+          <button class="btn btn-primary" id="aGo" type="submit">保存并连接</button>
+        </div>
+      </form>
+    </aside>
+
+    <section class="acc-inbox">
+      <div class="acc-inbox-head">
+        <h2 id="accTitle">收件箱</h2>
+        <span class="count" id="accCount">0 封</span>
+        <span class="status ok"><i></i>自动收信中</span>
+        <button class="icon-btn" id="accRefresh" type="button" title="立即刷新" aria-label="立即刷新">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3.5 12a8.5 8.5 0 1 0 2.7-6.2"/>
+            <path d="M3.5 4.5v5h5"/>
+          </svg>
+        </button>
+      </div>
+      <div class="msg-list" id="accMsgList"></div>
+      <article class="reader" id="accReader" hidden></article>
+    </section>
+  </div>
+
+</main>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-mask" id="modalMask"></div>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDesc">
+    <h3 id="modalTitle">确认删除</h3>
+    <p id="modalDesc"></p>
+    <div class="modal-acts">
+      <button class="btn" id="modalCancel" type="button">取消</button>
+      <button class="btn btn-danger" id="modalOk" type="button">删除</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="app.js" defer></script>
+</body>
+</html>

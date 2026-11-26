@@ -1,0 +1,10 @@
+# 只发布程序本体：数据库、截图、临时脚本一律不进仓库
+*
+
+!邮箱中心.py
+!web/
+!web/**
+!blocklist.txt
+!README.md
+!LICENSE
+!.gitignore
