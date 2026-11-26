@@ -293,6 +293,13 @@ def db():
         con.execute("ALTER TABLE addr ADD COLUMN dead INTEGER DEFAULT 0")
     if "dead_note" not in _cols:
         con.execute("ALTER TABLE addr ADD COLUMN dead_note TEXT")
+    if "owner_sid" not in _cols:
+        con.execute("ALTER TABLE addr ADD COLUMN owner_sid TEXT")
+    # 读列表 / 收信查重都按这几个列过滤，加索引免得数据涨了就慢
+    con.execute("CREATE INDEX IF NOT EXISTS idx_addr_owner ON addr(owner_sid)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_addr_seen ON addr(seen_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_msg_addr ON msg(address)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_msg_code ON msg(code)")
     # 老版本的 box 表迁移一次就够。之前没加这个开关，每调一次 db() 就把删掉的旧地址
     # 又插回来，用户会以为「删不掉」。
     try:
@@ -523,13 +530,13 @@ def imap_connect(acc):
     if not pwd:
         raise RuntimeError("这个邮箱还没填授权码，点「改码」补上")
     if port == 143:
-        m = imaplib.IMAP4(host, port)
+        m = imaplib.IMAP4(host, port, timeout=20)
         try:
             m.starttls()
         except Exception:
             pass
     else:
-        m = imaplib.IMAP4_SSL(host, port)
+        m = imaplib.IMAP4_SSL(host, port, timeout=20)
     m.login(user, pwd)
     # QQ / 163 不先发 ID 会报 Unsafe Login，发一下，失败也无所谓
     try:
@@ -585,6 +592,15 @@ def imap_scan(acc, known, limit=80):
             return 0, "搜索失败"
         uids = [int(x) for x in (data[0] or b"").split() if x.isdigit()]
         last = int(acc.get("last_uid") or 0)
+        if last < 0:
+            # 刚加/刚改授权码：拿当前最大 UID 当基线，历史邮件不灌进来
+            base = max(uids) if uids else 0
+            con = db()
+            con.execute("UPDATE account SET last_uid=?, last_scan=?, last_error='' WHERE id=?",
+                        (base, now(), acc["id"]))
+            con.commit()
+            con.close()
+            return 0, ""
         new = [u for u in uids if u > last][-limit:]
         if not new:
             con = db()
@@ -967,6 +983,33 @@ TEMP_BACKENDS = {
 OWN_DOMAIN = (os.environ.get("OWN_DOMAIN") or "agvuph.cn").strip().lower().lstrip("@")
 OWN_BACKEND = "owndomain"
 
+# ---- 访客隔离 / 管理口令 ------------------------------------------------
+# 每个浏览器一个随机 sid，地址入库时记下属于哪个 sid；读取一律按 sid 过滤。
+SID_COOKIE = "xsid"
+ADMIN_COOKIE = "xadm"
+
+
+def admin_pass():
+    return (os.environ.get("ADMIN_PASS") or "agvuph-2026").strip()
+
+
+def admin_token():
+    return hashlib.sha256(("xinxia-admin:" + admin_pass()).encode()).hexdigest()
+
+
+PASS_SYMBOLS = "!@#$%^&*-_=+?"
+_PASS_RNG = random.SystemRandom()
+
+
+def gen_password(n=16):
+    """给新邮箱生成注册用的强密码：大小写、数字、符号都有。"""
+    pools = [string.ascii_lowercase, string.ascii_uppercase, string.digits, PASS_SYMBOLS]
+    chars = [_PASS_RNG.choice(p) for p in pools]
+    allc = "".join(pools)
+    chars += [_PASS_RNG.choice(allc) for _ in range(max(0, n - len(chars)))]
+    _PASS_RNG.shuffle(chars)
+    return "".join(chars)
+
 
 # ---------------------------------------------------------------- 账号 / 地址操作
 def list_accounts():
@@ -1126,9 +1169,10 @@ def acc_add(email_addr, provider, pwd, host="", port=0):
     existed = con.execute("SELECT 1 FROM account WHERE email=?", (email_addr,)).fetchone() is not None
     con.close()
     aid = add_account(email_addr, provider, pwd, host, port or 993)
-    # 重新添加 = 可能换了授权码，让下一次扫描从头看，别被旧 last_uid 挡住
+    # 重新添加 = 可能换了授权码。last_uid 置 -1：下次扫描先取当前最大 UID 当基线，
+    # 只收这之后的新信，不把整个收件箱倒进来。
     con = db()
-    con.execute("UPDATE account SET last_uid=0 WHERE id=?", (aid,))
+    con.execute("UPDATE account SET last_uid=-1 WHERE id=?", (aid,))
     con.commit()
     con.close()
     ok, msg = acc_test(aid)
@@ -1181,13 +1225,18 @@ def acc_public():
     return out
 
 
-def list_addrs():
+def list_addrs(owner_sid="", admin=False):
     con = db()
-    out = rows(con.execute(
-        "SELECT a.address,a.account_id,a.kind,a.backend,a.tag,a.created,a.seen,a.seen_at,a.seen_subject,"
-        " a.dead,a.dead_note,"
-        " (SELECT email FROM account WHERE id=a.account_id) AS owner"
-        " FROM addr a ORDER BY a.seen_at DESC, a.created DESC"))
+    sql = ("SELECT a.address,a.account_id,a.kind,a.backend,a.tag,a.created,a.seen,a.seen_at,a.seen_subject,"
+           " a.dead,a.dead_note,a.password,a.owner_sid,"
+           " (SELECT email FROM account WHERE id=a.account_id) AS owner"
+           " FROM addr a")
+    args = ()
+    if not admin:
+        sql += " WHERE a.owner_sid=?"
+        args = (owner_sid,)
+    sql += " ORDER BY a.seen_at DESC, a.created DESC"
+    out = rows(con.execute(sql, args))
     con.close()
     bl = load_blocklist()
     for a in out:
@@ -1218,8 +1267,15 @@ def add_addrs(account_id, items, kind, tag=""):
     return made
 
 
-def remove_addr(address):
+def remove_addr(address, sid="", admin=False):
     con = db()
+    row = con.execute("SELECT owner_sid,kind FROM addr WHERE address=?", (address,)).fetchone()
+    if not row:
+        con.close()
+        return False
+    if not admin and row[0] != sid:
+        con.close()
+        return False
     con.execute("DELETE FROM addr WHERE address=?", (address,))
     con.execute("DELETE FROM msg WHERE address=?", (address,))
     con.commit()
@@ -1250,16 +1306,31 @@ def main_codes(limit=8):
     return out
 
 
-def read_msgs(address, light=False, local=False):
-    """light=True 时不带正文，给前端 3 秒轮询列表用；正文点开再单独取。
-    local=True 只读本地库、不碰供应商接口，用来切历史地址时先把已收邮件铺出来。"""
+def latest_codes(limit=30):
+    """给桌面通知客户端用：最近带验证码的邮件，按入库顺序倒排。
+    客户端按 id 去重，只弹新到的。"""
     con = db()
-    a = con.execute("SELECT address,backend,token,account_id,kind FROM addr WHERE address=?",
+    out = rows(con.execute(
+        "SELECT id,address,sender,subject,code,mdate,fetched FROM msg"
+        " WHERE code IS NOT NULL AND code<>'' ORDER BY rowid DESC LIMIT ?", (int(limit),)))
+    con.close()
+    return {"messages": out}
+
+
+def read_msgs(address, light=False, local=False, sid="", admin=False):
+    """light=True 时不带正文，给前端 3 秒轮询列表用；正文点开再单独取。
+    local=True 只读本地库、不碰供应商接口，用来切历史地址时先把已收邮件铺出来。
+    非管理员只能读自己会话建过的地址。"""
+    con = db()
+    a = con.execute("SELECT address,backend,token,account_id,kind,owner_sid FROM addr WHERE address=?",
                     (address,)).fetchone()
     if not a:
         con.close()
         return {"ok": False, "error": "没有这个地址"}
-    address, backend, token, aid, kind = a
+    address, backend, token, aid, kind, owner_sid = a
+    if not admin and owner_sid != sid:
+        con.close()
+        return {"ok": False, "error": "没有这个地址"}
     if backend in TEMP_BACKENDS and not local:
         dead = False
         try:
@@ -1319,15 +1390,20 @@ def read_msgs(address, light=False, local=False):
             "codes": codes, "latest_code": codes[0] if codes else ""}
 
 
-def get_msg(mid):
+def get_msg(mid, sid="", admin=False):
     con = db()
     hit = rows(con.execute(
-        "SELECT id,address,subject,sender,mdate,body,code,link,fetched FROM msg WHERE id=?",
+        "SELECT m.id,m.address,m.subject,m.sender,m.mdate,m.body,m.code,m.link,m.fetched,"
+        " a.owner_sid FROM msg m LEFT JOIN addr a ON a.address=m.address WHERE m.id=?",
         (mid,)))
     con.close()
     if not hit:
         return {"ok": False, "error": "没有这封邮件"}
-    return {"ok": True, "message": hit[0]}
+    row = hit[0]
+    if not admin and row.get("owner_sid") != sid:
+        return {"ok": False, "error": "没有这封邮件"}
+    row.pop("owner_sid", None)
+    return {"ok": True, "message": row}
 
 
 _DOM_CACHE = {}
@@ -1443,7 +1519,7 @@ def _temp_spread_pick(seq, bl):
 OWN_PREFIX_RE = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,22}[a-z0-9])?")
 
 
-def make_own_addrs(n, prefix, tag=""):
+def make_own_addrs(n, prefix, tag="", owner_sid=""):
     """自有域名地址：只登记，不发任何网络请求。前缀留空就随机。"""
     base = (prefix or "").strip().lower()
     if base and not OWN_PREFIX_RE.fullmatch(base):
@@ -1456,20 +1532,24 @@ def make_own_addrs(n, prefix, tag=""):
             if base and n > 1:
                 pre = "%s%02d" % (base, i + 1)
             addr = "%s@%s" % (pre, OWN_DOMAIN)
+            old = con.execute("SELECT password,owner_sid FROM addr WHERE address=?", (addr,)).fetchone()
+            pw = (old[0] if old and old[0] else "") or gen_password()
+            owner = (old[1] if old else None) or owner_sid
             con.execute(
-                "INSERT OR IGNORE INTO addr(address,account_id,kind,backend,token,tag,created,seen)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (addr, None, "temp", OWN_BACKEND, "", tag or "", now(), ""))
-            con.execute("UPDATE addr SET dead=0, dead_note='' WHERE address=?", (addr,))
+                "INSERT OR IGNORE INTO addr(address,account_id,kind,backend,token,tag,created,seen,password,owner_sid)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (addr, None, "temp", OWN_BACKEND, "", tag or "", now(), "", pw, owner))
+            con.execute("UPDATE addr SET dead=0, dead_note=?, password=?, owner_sid=? WHERE address=?",
+                        ("", pw, owner, addr))
             made.append({"address": addr, "backend": OWN_BACKEND,
-                         "domain": OWN_DOMAIN, "blocked": False})
+                         "domain": OWN_DOMAIN, "blocked": False, "password": pw})
         con.commit()
     finally:
         con.close()
     return made, []
 
 
-def make_temp(n, prefix, tag, backend="", domain=""):
+def make_temp(n, prefix, tag, backend="", domain="", owner_sid=""):
     """造临时邮箱。backend 留空 = 多家供应商轮着来，域名也跟着换。
     返回 (made, errors)。made 里带 blocked 标记，前端可以直接标红。"""
     made, errors = [], []
@@ -1479,7 +1559,7 @@ def make_temp(n, prefix, tag, backend="", domain=""):
         n = 1
     n = max(1, min(n, 20))
     if backend == OWN_BACKEND:
-        return make_own_addrs(n, prefix, tag)
+        return make_own_addrs(n, prefix, tag, owner_sid)
     bl = load_blocklist()
     con = db()
     seq0 = con.execute("SELECT COUNT(*) FROM addr WHERE kind='temp'").fetchone()[0]
@@ -1525,14 +1605,17 @@ def make_temp(n, prefix, tag, backend="", domain=""):
         addr = hit["address"]
         dom = addr.split("@")[-1].lower()
         con = db()
-        con.execute("INSERT OR REPLACE INTO addr(address,account_id,kind,backend,token,password,tag,created,seen)"
-                    " VALUES(?,?,?,?,?,?,?,?,?)",
+        old = con.execute("SELECT password,owner_sid FROM addr WHERE address=?", (addr,)).fetchone()
+        pw = (old[0] if old and old[0] else "") or gen_password()
+        owner = (old[1] if old else None) or owner_sid
+        con.execute("INSERT OR REPLACE INTO addr(address,account_id,kind,backend,token,password,tag,created,seen,owner_sid)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (addr, None, "temp", hit["backend"], hit["token"],
-                     hit.get("password", ""), tag or "", now(), ""))
+                     pw, tag or "", now(), "", owner))
         con.commit()
         con.close()
         made.append({"address": addr, "backend": hit["backend"],
-                     "domain": dom, "blocked": dom in bl})
+                     "domain": dom, "blocked": dom in bl, "password": pw})
         if i + 1 < n:
             time.sleep(1.2)
     return made, errors
@@ -1546,10 +1629,34 @@ _SCAN_STATE = {"running": False, "last": "", "found": 0, "error": ""}
 _IMAP_LAST = [0.0]
 _IMAP_RUN_LOCK = threading.Lock()
 
+# 每个账号各自的退避：连不上就 20s → 40s → 80s … 最多 10 分钟，
+# 免得密码错了还每 8 秒去撞一次，把服务商惹到限流。
+_ACC_BACKOFF = {}
+_ACC_LOCK = threading.Lock()
 
-def scan_accounts_now(wait=0):
+
+def _acc_ready(aid):
+    with _ACC_LOCK:
+        nxt, _ = _ACC_BACKOFF.get(aid, (0.0, 0))
+    return time.time() >= nxt
+
+
+def _acc_ok(aid):
+    with _ACC_LOCK:
+        _ACC_BACKOFF.pop(aid, None)
+
+
+def _acc_fail(aid):
+    with _ACC_LOCK:
+        fails = _ACC_BACKOFF.get(aid, (0.0, 0))[1] + 1
+        wait = min(600, 20 * (2 ** (fails - 1)))
+        _ACC_BACKOFF[aid] = (time.time() + wait, fails)
+
+
+def scan_accounts_now(wait=0, force=False):
     """扫所有自己的 IMAP 邮箱。后台和手动共用，同一时刻只跑一份，免得重复登录、抢写锁。
-    wait 秒 = 愿意等后台那轮跑完再接手；0 = 拿不到锁就返回。"""
+    wait 秒 = 愿意等后台那轮跑完再接手；0 = 拿不到锁就返回。
+    force=True（手动点刷新）时不理会退避，立刻重试。"""
     acquired = _IMAP_RUN_LOCK.acquire(timeout=wait) if wait else _IMAP_RUN_LOCK.acquire(blocking=False)
     if not acquired:
         return {"ok": False, "found": 0, "errors": ["正在收信，稍等"]}
@@ -1559,7 +1666,15 @@ def scan_accounts_now(wait=0):
         accs = rows(con.execute(
             "SELECT id,email,provider,imap_host,imap_port,imap_user,imap_pass,last_uid FROM account"))
         con.close()
+        # 自有域名的信走 QQ 最稳，先扫它；Gmail 链路时通时断，放最后，超时也不挡别人
+        accs.sort(key=lambda a: 0 if (a.get("provider") in ("qq", "foxmail")) else 1)
+        started = time.time()
         for acc in accs:
+            if time.time() - started > 45:
+                errs.append("本轮时间到，剩余账号下一轮再扫")
+                break
+            if not force and not _acc_ready(acc["id"]):
+                continue
             con = db()
             known = [r[0] for r in con.execute(
                 "SELECT address FROM addr WHERE account_id=?", (acc["id"],))]
@@ -1569,8 +1684,12 @@ def scan_accounts_now(wait=0):
                 got += n
                 if err:
                     errs.append("%s：%s" % (acc["email"], err))
+                    _acc_fail(acc["id"])
+                else:
+                    _acc_ok(acc["id"])
             except Exception as e:
                 errs.append("%s：%s" % (acc["email"], str(e)[:120]))
+                _acc_fail(acc["id"])
         return {"ok": True, "found": got, "errors": errs}
     finally:
         _IMAP_RUN_LOCK.release()
@@ -1578,11 +1697,12 @@ def scan_accounts_now(wait=0):
 
 def scan_imap(force=False):
     """扫所有 IMAP 账号。返回新抓到的邮件数。
-    后台每 5 秒跑一轮，但 IMAP 不必这么勤，默认 20 秒最多连一次。"""
-    if not force and time.time() - _IMAP_LAST[0] < 20:
+    后台每 5 秒跑一轮，IMAP 默认 8 秒最多连一次；失败按账号退避。"""
+    gap = float(os.environ.get("IMAP_GAP") or 8)
+    if not force and time.time() - _IMAP_LAST[0] < max(5.0, gap):
         return 0
     _IMAP_LAST[0] = time.time()
-    return scan_accounts_now().get("found", 0)
+    return scan_accounts_now(force=force).get("found", 0)
 
 
 def scan_all(quiet=True, force=False):
@@ -1695,8 +1815,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        for ck in getattr(self, "_cookies", []):
+            self.send_header("Set-Cookie", ck)
+        self._cookies = []
         self.end_headers()
         self.wfile.write(raw)
+
+    def _auth(self):
+        """每个浏览器一个 sid；管理员靠 xadm cookie。"""
+        jar = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                jar[k] = v
+        sid = (jar.get(SID_COOKIE) or "").strip()
+        self._cookies = getattr(self, "_cookies", [])
+        if len(sid) < 16:
+            sid = hashlib.sha256(os.urandom(24)).hexdigest()[:32]
+            self._cookies.append(
+                "%s=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax" % (SID_COOKIE, sid))
+        self.sid = sid
+        self.admin = (jar.get(ADMIN_COOKIE) or "") == admin_token()
+
+    def _deny_admin(self):
+        return self._send(401, {"error": "需要访问口令"})
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -1710,6 +1852,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        self._auth()
         try:
             if u.path in ("/", "/index.html"):
                 return self._send(200, web_file("index.html"), "text/html; charset=utf-8")
@@ -1721,27 +1864,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, web_file("favicon.svg"), "image/svg+xml")
             if u.path == "/api/state":
                 return self._send(200, {
-                    "addrs": list_addrs(),
-                    "accounts": acc_public(),
-                    "scan": _SCAN_STATE,
+                    "addrs": list_addrs(self.sid, self.admin),
+                    "accounts": acc_public() if self.admin else [],
+                    "scan": _SCAN_STATE if self.admin else {},
                     "temps": temp_info(),
-                    "proxy": proxy_state(),
-                    "main_codes": main_codes(),
+                    "proxy": proxy_state() if self.admin else {},
+                    "main_codes": main_codes() if self.admin else [],
+                    "admin": self.admin,
                 })
             if u.path == "/api/providers":
                 return self._send(200, {"providers": provider_list()})
             if u.path == "/api/accounts":
+                if not self.admin:
+                    return self._deny_admin()
                 return self._send(200, {"accounts": acc_public()})
             if u.path == "/api/domains":
                 return self._send(200, {"temps": temp_info()})
             if u.path == "/api/proxy":
+                if not self.admin:
+                    return self._deny_admin()
                 return self._send(200, proxy_state())
             if u.path == "/api/msgs":
                 light = (q.get("light") or ["0"])[0] in ("1", "true", "yes")
                 local = (q.get("local") or ["0"])[0] in ("1", "true", "yes")
-                return self._send(200, read_msgs((q.get("address") or [""])[0], light, local))
+                return self._send(200, read_msgs((q.get("address") or [""])[0], light, local,
+                                                self.sid, self.admin))
             if u.path == "/api/msg":
-                return self._send(200, get_msg((q.get("id") or [""])[0]))
+                return self._send(200, get_msg((q.get("id") or [""])[0], self.sid, self.admin))
+            if u.path == "/api/updates":
+                if not self.admin:
+                    return self._deny_admin()
+                return self._send(200, latest_codes())
             if u.path == "/api/check":
                 return self._send(200, check_domain((q.get("domain") or [""])[0]))
             return self._send(404, {"error": "not found"})
@@ -1751,20 +1904,46 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         b = self._body()
+        self._auth()
         try:
+            if u.path == "/api/login":
+                if (b.get("pass") or "").strip() == admin_pass():
+                    # 老数据没有 owner_sid，归到管理员当前这个浏览器，首页还能看见；
+                    # 其他访客永远看不到。
+                    con = db()
+                    con.execute("UPDATE addr SET owner_sid=? WHERE owner_sid IS NULL OR owner_sid=''",
+                                (self.sid,))
+                    con.commit()
+                    con.close()
+                    self._cookies.append(
+                        "%s=%s; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax"
+                        % (ADMIN_COOKIE, admin_token()))
+                    return self._send(200, {"ok": True})
+                return self._send(401, {"ok": False, "error": "口令不对"})
+            if u.path == "/api/logout":
+                self._cookies.append("%s=; Path=/; Max-Age=0" % ADMIN_COOKIE)
+                return self._send(200, {"ok": True})
             if u.path == "/api/scan":
-                return self._send(200, scan_accounts_now(wait=25))
+                if not self.admin:
+                    return self._deny_admin()
+                return self._send(200, scan_accounts_now(wait=25, force=True))
             if u.path == "/api/proxy":
+                if not self.admin:
+                    return self._deny_admin()
                 set_proxy(b.get("proxy", ""))
                 return self._send(200, proxy_state())
             if u.path == "/api/proxytest":
+                if not self.admin:
+                    return self._deny_admin()
                 return self._send(200, proxy_test())
             if u.path == "/api/newtemp":
                 made, errors = make_temp(int(b.get("n") or 1), b.get("prefix", ""),
                                          b.get("tag", ""), b.get("backend", ""),
-                                         b.get("domain", ""))
+                                         b.get("domain", ""), self.sid)
                 return self._send(200, {"made": made, "errors": errors})
             if u.path == "/api/clear":
+                if not self.admin:
+                    return self._deny_admin()
                 # 只清临时邮箱那一批，长期账号要留着。
                 con = db()
                 keep = [r[0] for r in con.execute(
@@ -1780,14 +1959,20 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
                 return self._send(200, {"ok": True, "addrs": n})
             if u.path == "/api/rm":
-                return self._send(200, {"ok": remove_addr(b.get("address", ""))})
+                return self._send(200, {"ok": remove_addr(b.get("address", ""), self.sid, self.admin)})
             if u.path == "/api/accadd":
+                if not self.admin:
+                    return self._deny_admin()
                 return self._send(200, acc_add(b.get("email", ""), b.get("provider", ""),
                                                 b.get("pass", ""), b.get("host", ""),
                                                 int(b.get("port") or 0)))
             if u.path == "/api/accrm":
+                if not self.admin:
+                    return self._deny_admin()
                 return self._send(200, {"ok": remove_account(int(b.get("id") or 0))})
             if u.path == "/api/acctest":
+                if not self.admin:
+                    return self._deny_admin()
                 ok, msg = acc_test(int(b.get("id") or 0))
                 return self._send(200, {"ok": ok, "msg": msg})
             return self._send(404, {"error": "not found"})

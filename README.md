@@ -7,7 +7,8 @@
 ## 功能
 
 - 三家免费临时邮箱供应商：temp-mail.io（默认）、tempmail.lol、tempmail.plus
-- 自有域名收信：`agvuph.cn` 全量转发到自己的 Gmail，项目读 Gmail 后按原始收件人还原成独立地址
+- 自有域名收信：`agvuph.cn` 全量转发到自己的 QQ 邮箱（Gmail 也能用，国内服务器到 Gmail 的 IMAP 不稳定），项目读 IMAP 后按原始收件人还原成独立地址
+- 每个地址自动生成 16 位强密码（大小写 + 数字 + 符号），给注册目标站时用，不是邮箱登录密码
 - 自定义前缀：留空随机；非法字符、超长会提示，不会静默失败
 - 自动收信：前台定时轮询 + 后台定时扫描，没有「刷新」按钮也能出新邮件（也保留了手动刷新）
 - 验证码识别：按上下文抓 4–8 位数字，列表上直接给复制按钮
@@ -38,6 +39,14 @@ HOST=0.0.0.0 PORT=8080 python 邮箱中心.py --no-browser   # 公网 / 容器
 | `PORT` | `18899` | 监听端口 |
 | `DB_PATH` | 脚本同目录 `邮箱中心.db` | SQLite 数据库位置 |
 | `OWN_DOMAIN` | `agvuph.cn` | 自有收信域名，填了就出现在来源列表里 |
+| `ADMIN_PASS` | `agvuph-2026` | 「我的邮箱」和后台接口的访问口令，部署时务必改掉 |
+
+## 访客隔离与访问口令
+
+- 每个浏览器一个随机会话（cookie `xsid`），新建的地址记在这个会话名下；列表、邮件、验证码、删除都按会话过滤，别人看不到，同名也不会串。
+- 首页对普通访客只返回他自己的地址和邮件；`accounts`、`main_codes` 只发给管理员。
+- 「我的邮箱」要先输口令（`ADMIN_PASS`），对应接口没口令一律 401，不是只在界面上藏。
+- 老数据（升级前没有会话归属的地址）会在管理员第一次登录时归到当前浏览器，避免看起来像丢了。
 
 也可以用 `--host` / `--port` 覆盖。
 
@@ -116,3 +125,20 @@ server {
 ## 许可
 
 MIT
+
+## 桌面通知客户端（Windows）
+
+`desktop/` 下是一个托盘常驻的小程序，新邮件到了会在屏幕右下角弹窗，验证码可以直接点「复制验证码」。
+
+只依赖 Windows 自带的 PowerShell 5 + WinForms，不用装 Python 或 pip 包。
+
+1. 复制 `desktop/config.example.json` 为 `desktop/config.json`，把 `AdminPass` 改成网站的访问口令（`ADMIN_PASS`）。
+2. 右键「以管理员身份运行」`desktop/install.bat`，或者：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\desktop\install.ps1 -Pass 你的口令 -Url https://agvuph.cn
+   ```
+3. 脚本会写配置、在「启动」文件夹放快捷方式（开机自启），并立刻启动一份。
+
+托盘图标右键：立即检查 / 暂停或继续 / 打开网站 / 退出。程序按 `/api/updates` 轮询，用邮件 id 去重，同一封不会重复弹；连不上时按 10 秒 → 20 秒 → … 最多 5 分钟退避，不刷日志。
+
+想开机自启但不弹黑框：启动项指向 `notify.vbs`，它用隐藏窗口跑 `notify.ps1`。

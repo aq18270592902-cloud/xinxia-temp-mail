@@ -67,6 +67,12 @@
         <button class="btn btn-outline" id="copyAddr">复制地址</button>
         <button class="btn btn-quiet btn-del" id="delAddr" type="button">删除地址</button>
       </div>
+      <div class="addr-pass" id="addrPassWrap" hidden>
+        <span class="label">注册密码</span>
+        <code id="addrPass"></code>
+        <button class="btn btn-outline" id="copyPass" type="button">复制密码</button>
+        <span class="pass-note">注册网站时填这个，不是邮箱登录密码</span>
+      </div>
     </div>
 
     <div class="expired" id="expiredBox" hidden>
@@ -117,7 +123,17 @@
     <p class="page-lede">接入自己的 QQ / Gmail，在这里收信、读信、复制验证码。</p>
   </div>
 
-  <div class="account-grid">
+  <section class="acc-gate" id="accGate" hidden>
+    <h2>需要访问口令</h2>
+    <p class="hint">这一页是你自己的收信箱，输口令才能进。</p>
+    <form id="gateForm">
+      <input id="gatePass" type="password" placeholder="访问口令" autocomplete="current-password">
+      <button class="btn btn-primary" type="submit">进入</button>
+    </form>
+    <p class="hint" id="gateHint"></p>
+  </section>
+
+  <div class="account-grid" id="accBody">
     <aside class="acc-side">
       <div class="side-head">
         <h2>已接入</h2>

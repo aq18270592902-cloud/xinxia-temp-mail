@@ -20,7 +20,8 @@
     accMsgs: [],
     accSig: null,
     accPending: false,
-    accListSig: ""
+    accListSig: "",
+    admin: false
   };
   var LOCAL_CACHE = {};
   var fetchingMsgs = false;
@@ -207,13 +208,28 @@
     }
     window.scrollTo(0, 0);
     if (isAcc) {
-      if (!state.accActive || !findAccount(state.accActive)) {
-        state.accActive = state.accounts.length ? state.accounts[0].email : "";
-      }
-      if (state.accActive) { localStorage.setItem(LS_ACC, state.accActive); }
-      renderAccounts();
-      renderAccInbox();
+      renderAccountView();
     }
+  }
+
+  function renderAccountView() {
+    if (state.view !== "accounts") { return; }
+    var gate = $("accGate");
+    var body = $("accBody");
+    if (!state.admin) {
+      gate.hidden = false;
+      body.hidden = true;
+      $("gatePass").focus();
+      return;
+    }
+    gate.hidden = true;
+    body.hidden = false;
+    if (!state.accActive || !findAccount(state.accActive)) {
+      state.accActive = state.accounts.length ? state.accounts[0].email : "";
+    }
+    if (state.accActive) { localStorage.setItem(LS_ACC, state.accActive); }
+    renderAccounts();
+    renderAccInbox();
   }
 
   /* ---------- 数据 ---------- */
@@ -221,6 +237,7 @@
   function fetchState() {
     return fetch("/api/state").then(function (r) { return r.json(); }).then(function (j) {
       state.accounts = j.accounts || [];
+      state.admin = !!j.admin;
       state.temps = j.temps || [];
       state.mainCodes = j.main_codes || [];
       var temps = (j.addrs || []).filter(function (a) { return a.kind === "temp"; });
@@ -256,8 +273,7 @@
 
       renderMailbox();
       if (state.view === "accounts") {
-        renderAccounts();
-        renderAccInbox();
+        renderAccountView();
       }
     }).catch(function () {});
   }
@@ -281,8 +297,14 @@
       sel._sig = sig;
     }
     var fallback = "";
-    for (var i = 0; i < list.length; i++) {
-      if (list[i].recommend) { fallback = list[i].key || list[i].name; break; }
+    // 默认来源：上次选的（localStorage）优先；第一次打开就用自己的域名
+    for (var j = 0; j < list.length; j++) {
+      if ((list[j].key || list[j].name) === "owndomain") { fallback = "owndomain"; break; }
+    }
+    if (!fallback) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].recommend) { fallback = list[i].key || list[i].name; break; }
+      }
     }
     if (!fallback) { fallback = list[0].key || list[0].name; }
     var names = list.map(function (t) { return t.key || t.name; });
@@ -348,6 +370,15 @@
 
     var meta = findAddr(state.active);
     var dead = !!(meta && meta.dead);
+    var passWrap = $("addrPassWrap");
+    if (passWrap) {
+      if (meta && meta.password) {
+        $("addrPass").textContent = meta.password;
+        passWrap.hidden = false;
+      } else {
+        passWrap.hidden = true;
+      }
+    }
     var tag = $("provTag");
     tag.textContent = meta ? (backendLabel(meta.backend) + (dead ? " · 已过期" : "")) : "";
     tag.classList.toggle("dead", dead);
@@ -499,8 +530,21 @@
   }
 
   function renderMsgList(container, msgs) {
-    container.textContent = "";
-    if (!msgs || !msgs.length) {
+    msgs = msgs || [];
+    // 列表按行增量更新：只插入新行、移除消失的行，不整块清空重画，
+    // 这样新邮件到达时滚动位置和焦点都不会被拽走。
+    var old = {};
+    var kids = container.children;
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (k.classList && k.classList.contains("msg-row")) {
+        old[k.getAttribute("data-id")] = k;
+      }
+    }
+    var ph = container.querySelector(".empty");
+    if (msgs.length && ph) { container.removeChild(ph); }
+    if (!msgs.length) {
+      container.textContent = "";
       var empty = document.createElement("div");
       empty.className = "empty";
       var t = document.createElement("strong");
@@ -510,9 +554,26 @@
       return 0;
     }
     var unread = 0;
+    var cursor = container.firstChild;
     msgs.forEach(function (m) {
       if (!isRead(m.id)) { unread++; }
-      container.appendChild(buildRow(m));
+      var node = old[m.id];
+      if (node) {
+        delete old[m.id];
+      } else {
+        node = buildRow(m);
+        node.classList.add("fresh");
+        setTimeout(function () { node.classList.remove("fresh"); }, 1800);
+      }
+      if (node === cursor) {
+        cursor = cursor.nextSibling;
+      } else {
+        container.insertBefore(node, cursor);
+      }
+    });
+    Object.keys(old).forEach(function (id) {
+      var n = old[id];
+      if (n.parentNode === container) { container.removeChild(n); }
     });
     return unread;
   }
@@ -932,11 +993,19 @@
   }
 
   function fetchAccMsgs() {
+    if (!state.admin) { return Promise.resolve(); }
     var acc = findAccount(state.accActive);
     if (!acc) { return Promise.resolve(); }
     var email = acc.email;
     return fetch("/api/msgs?address=" + encodeURIComponent(email) + "&light=1")
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (r.status === 401) {
+          state.admin = false;
+          renderAccountView();
+          return {};
+        }
+        return r.json();
+      })
       .then(function (j) {
         if (state.accActive !== email) { return; }
         var msgs = j.messages || [];
@@ -980,7 +1049,7 @@
   }
 
   function pollAccMsgs() {
-    if (state.view !== "accounts" || !state.accActive || fetchingAcc) { return; }
+    if (!state.admin || state.view !== "accounts" || !state.accActive || fetchingAcc) { return; }
     var acc = findAccount(state.accActive);
     if (!acc) { return; }
     fetchingAcc = true;
@@ -991,11 +1060,17 @@
         var msgs = j.messages || [];
         cachePut(acc.email, msgs);
         var sig = sigOf(msgs);
+        var seenIds = {};
+        (state.accMsgs || []).forEach(function (m) { seenIds[m.id] = 1; });
+        var fresh = msgs.filter(function (m) { return !seenIds[m.id]; }).length;
         state.accPending = false;
         if (sig !== state.accSig) {
           state.accSig = sig;
           state.accMsgs = msgs;
           renderAccMsgs();
+          if (fresh > 0 && state.view === "accounts") {
+            toast("收到 " + fresh + " 封新邮件");
+          }
         }
       })
       .catch(function () {})
@@ -1106,6 +1181,29 @@
   $("copyAddr").addEventListener("click", function () {
     if (state.active) { copyText(state.active, "地址已复制"); }
   });
+  $("copyPass").addEventListener("click", function () {
+    var meta = findAddr(state.active);
+    if (meta && meta.password) { copyText(meta.password, "密码已复制"); }
+  });
+  $("gateForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var p = ($("gatePass").value || "").trim();
+    if (!p) { $("gateHint").textContent = "先输口令"; return; }
+    $("gateHint").textContent = "";
+    fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pass: p })
+    }).then(function (r) { return r.json().then(function (j) { return { code: r.status, j: j }; }); })
+      .then(function (res) {
+        if (!res.j.ok) {
+          $("gateHint").textContent = "口令不对";
+          return;
+        }
+        $("gatePass").value = "";
+        return fetchState().then(function () { renderAccountView(); });
+      }).catch(function () { $("gateHint").textContent = "网络不通，再试一次"; });
+  });
   $("addrSwitch").addEventListener("change", function () {
     if (this.value) { setActive(this.value); }
   });
@@ -1186,6 +1284,6 @@
     if (location.hash === "#me") { showView("accounts", false); }
   });
   setInterval(pollMsgs, 3000);
-  setInterval(pollAccMsgs, 4000);
-  setInterval(fetchState, 10000);
+  setInterval(pollAccMsgs, 3000);
+  setInterval(fetchState, 5000);
 })();
