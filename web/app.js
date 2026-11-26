@@ -177,9 +177,10 @@
     return null;
   }
 
-  function provMeta(name) {
+  function provMeta(key) {
     for (var i = 0; i < state.temps.length; i++) {
-      if (state.temps[i].name === name) { return state.temps[i]; }
+      var t = state.temps[i];
+      if ((t.key || t.name) === key) { return t; }
     }
     return null;
   }
@@ -267,13 +268,13 @@
     var list = state.temps || [];
     if (!list.length) { return; }
     var sig = list.map(function (t) {
-      return t.name + (t.recommend ? "*" : "") + (t.blurb || "");
+      return (t.key || t.name) + t.name + (t.recommend ? "*" : "") + (t.blurb || "");
     }).join("|");
     if (sel._sig !== sig) {
       sel.textContent = "";
       list.forEach(function (t) {
         var o = document.createElement("option");
-        o.value = t.name;
+        o.value = t.key || t.name;
         o.textContent = t.name + "（" + (t.recommend ? "推荐，" : "") + (t.blurb || "") + "）";
         sel.appendChild(o);
       });
@@ -281,10 +282,10 @@
     }
     var fallback = "";
     for (var i = 0; i < list.length; i++) {
-      if (list[i].recommend) { fallback = list[i].name; break; }
+      if (list[i].recommend) { fallback = list[i].key || list[i].name; break; }
     }
-    if (!fallback) { fallback = list[0].name; }
-    var names = list.map(function (t) { return t.name; });
+    if (!fallback) { fallback = list[0].key || list[0].name; }
+    var names = list.map(function (t) { return t.key || t.name; });
     var want = sel.value || localStorage.getItem(LS_PROV) || "";
     sel.value = (want && names.indexOf(want) >= 0) ? want : fallback;
     localStorage.setItem(LS_PROV, sel.value);
@@ -295,11 +296,24 @@
     var el = $("prefixHint");
     if (!el) { return; }
     var meta = provMeta($("genProv").value);
-    var text = (meta && meta.name === "tempmail.lol")
-      ? "这个服务商会在前缀后加 6 位随机尾巴"
-      : "";
+    var text = "";
+    if (meta && meta.name === "tempmail.lol") {
+      text = "这个服务商会在前缀后加 6 位随机尾巴";
+    } else if (meta && meta.key === "owndomain") {
+      text = "转发到你的 Gmail，收信有十几秒延迟；前缀留空随机";
+    }
     el.textContent = text;
     el.hidden = false;   // 始终占位，切换服务商时下面的内容不跳
+  }
+
+  function backendLabel(backend) {
+    if (backend === "owndomain") {
+      for (var i = 0; i < state.temps.length; i++) {
+        if (state.temps[i].key === "owndomain") { return state.temps[i].name; }
+      }
+      return "自己的域名";
+    }
+    return backend || "";
   }
 
   function readPrefix() {
@@ -335,7 +349,7 @@
     var meta = findAddr(state.active);
     var dead = !!(meta && meta.dead);
     var tag = $("provTag");
-    tag.textContent = meta ? (meta.backend + (dead ? " · 已过期" : "")) : "";
+    tag.textContent = meta ? (backendLabel(meta.backend) + (dead ? " · 已过期" : "")) : "";
     tag.classList.toggle("dead", dead);
     tag.hidden = !meta;
     $("expiredBox").hidden = !dead;

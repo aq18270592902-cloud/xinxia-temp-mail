@@ -540,6 +540,26 @@ def imap_connect(acc):
     return m
 
 
+MAIL_ADDR_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def own_domain_recipient(msg):
+    """从邮件头里还原「这封信原本是发给哪个自有域名地址」。
+    Cloudflare Email Routing 会保留原 To，并可能补 X-Forwarded-To / X-Original-To；
+    Gmail 自己的 Delivered-To 是被改写过的，所以放在后面。"""
+    if not OWN_DOMAIN:
+        return ""
+    for hdr in ("X-Original-To", "X-Forwarded-To", "To", "Cc", "Delivered-To"):
+        raw = decode_mime(msg.get(hdr, "") or "")
+        if not raw:
+            continue
+        for a in MAIL_ADDR_RE.findall(raw):
+            a = a.lower()
+            if a.endswith("@" + OWN_DOMAIN):
+                return a
+    return ""
+
+
 def imap_scan(acc, known, limit=80):
     """扫一个账号的新邮件，按收件人地址归位，抠验证码。返回 (新消息数, 错误)。"""
     try:
@@ -559,6 +579,7 @@ def imap_scan(acc, known, limit=80):
     found = 0
     try:
         m.select("INBOX", readonly=True)
+
         typ, data = m.uid("search", None, "ALL")
         if typ != "OK":
             return 0, "搜索失败"
@@ -585,6 +606,7 @@ def imap_scan(acc, known, limit=80):
             except Exception:
                 continue
             to_hdr = decode_mime(msg.get("To", ""))
+            own_to = own_domain_recipient(msg)
             subj = decode_mime(msg.get("Subject", ""))
             frm = decode_mime(msg.get("From", ""))
             mdate = decode_mime(msg.get("Date", ""))
@@ -595,19 +617,30 @@ def imap_scan(acc, known, limit=80):
             link = pick_link(text)
             addrs = re.findall(r"[\w.+-]+@[\w.-]+\.\w+", to_hdr)
             target = ""
-            for a in addrs:
-                if a.lower() in known_lower:
-                    target = known_lower[a.lower()]
-                    break
+            # 自有域名优先：同一个 Gmail 下按原始收件人拆成不同地址，互相不串
+            if own_to:
+                target = own_to
+            else:
+                for a in addrs:
+                    if a.lower() in known_lower:
+                        target = known_lower[a.lower()]
+                        break
             if not target:
                 target = acc["email"]
             parsed.append({
                 "id": "%d:%d" % (acc["id"], uid), "target": target, "subj": subj,
                 "frm": frm, "mdate": mdate, "text": text, "code": code, "link": link,
+                "own": bool(own_to),
             })
         con = db()
         try:
             for p in parsed:
+                # Gmail 里新出现的前缀：补一条地址记录，历史列表里能直接看到
+                if p["own"]:
+                    con.execute(
+                        "INSERT OR IGNORE INTO addr(address,account_id,kind,backend,created)"
+                        " VALUES(?,?,?,?,?)",
+                        (p["target"], None, "temp", OWN_BACKEND, now()))
                 con.execute(
                     "INSERT OR REPLACE INTO msg(id,address,account_id,subject,sender,mdate,body,code,link,fetched)"
                     " VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -927,6 +960,12 @@ TEMP_BACKENDS = {
     "tempmail.lol": TempMailLol,
     "tempmail.plus": TempMailPlus,
 }
+
+# 自有域名：Cloudflare Email Routing 把 *@agvuph.cn 全量转发到自己的 Gmail，
+# 项目再读 Gmail 的 IMAP，按原始收件人（To / X-Forwarded-To / X-Original-To）
+# 还原成一个个独立地址。创建时不需要发任何网络请求，只是登记前缀。
+OWN_DOMAIN = (os.environ.get("OWN_DOMAIN") or "agvuph.cn").strip().lower().lstrip("@")
+OWN_BACKEND = "owndomain"
 
 
 # ---------------------------------------------------------------- 账号 / 地址操作
@@ -1346,6 +1385,7 @@ def temp_info():
     for name, cls in TEMP_BACKENDS.items():
         doms = backend_domains(name)
         out.append({
+            "key": name,
             "name": name,
             "can_prefix": bool(getattr(cls, "can_prefix", False)),
             "can_domain": bool(getattr(cls, "can_domain", False)) and bool(doms),
@@ -1354,6 +1394,20 @@ def temp_info():
             "recommend": bool(getattr(cls, "recommend", False)),
             "domain_count": len(doms),
             "domains": [{"domain": d, "blocked": d.lower() in bl} for d in doms],
+        })
+    if OWN_DOMAIN:
+        out.append({
+            "key": OWN_BACKEND,
+            "name": OWN_DOMAIN,
+            "can_prefix": True,
+            "can_domain": False,
+            "note": "自己的域名：Cloudflare Email Routing 把该域全量转发到 Gmail，"
+                    "本项目读 Gmail 的 IMAP，按原始收件人还原地址",
+            "blurb": "自己的域名，转发到 Gmail",
+            "recommend": False,
+            "domain_count": 1,
+            "domains": [{"domain": OWN_DOMAIN, "blocked": False}],
+            "own": True,
         })
     return out
 
@@ -1386,6 +1440,35 @@ def _temp_spread_pick(seq, bl):
     return name, dom
 
 
+OWN_PREFIX_RE = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,22}[a-z0-9])?")
+
+
+def make_own_addrs(n, prefix, tag=""):
+    """自有域名地址：只登记，不发任何网络请求。前缀留空就随机。"""
+    base = (prefix or "").strip().lower()
+    if base and not OWN_PREFIX_RE.fullmatch(base):
+        return [], ["前缀只能用字母、数字和 . _ -，1–24 位，不能以符号开头或结尾"]
+    made = []
+    con = db()
+    try:
+        for i in range(n):
+            pre = base or human_local()
+            if base and n > 1:
+                pre = "%s%02d" % (base, i + 1)
+            addr = "%s@%s" % (pre, OWN_DOMAIN)
+            con.execute(
+                "INSERT OR IGNORE INTO addr(address,account_id,kind,backend,token,tag,created,seen)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (addr, None, "temp", OWN_BACKEND, "", tag or "", now(), ""))
+            con.execute("UPDATE addr SET dead=0, dead_note='' WHERE address=?", (addr,))
+            made.append({"address": addr, "backend": OWN_BACKEND,
+                         "domain": OWN_DOMAIN, "blocked": False})
+        con.commit()
+    finally:
+        con.close()
+    return made, []
+
+
 def make_temp(n, prefix, tag, backend="", domain=""):
     """造临时邮箱。backend 留空 = 多家供应商轮着来，域名也跟着换。
     返回 (made, errors)。made 里带 blocked 标记，前端可以直接标红。"""
@@ -1395,6 +1478,8 @@ def make_temp(n, prefix, tag, backend="", domain=""):
     except Exception:
         n = 1
     n = max(1, min(n, 20))
+    if backend == OWN_BACKEND:
+        return make_own_addrs(n, prefix, tag)
     bl = load_blocklist()
     con = db()
     seq0 = con.execute("SELECT COUNT(*) FROM addr WHERE kind='temp'").fetchone()[0]
@@ -1535,13 +1620,14 @@ OLD_GAP = 30.0
 def scan_temps(min_gap=None):
     """临时邮箱没法用 IMAP 推，只能挨个去后端问。带节流，别把 tempmail.lol 问爆。"""
     con = db()
-    addrs = [(r[0], r[1], r[2]) for r in con.execute(
-        "SELECT address, created, dead FROM addr WHERE kind='temp'"
+    addrs = [(r[0], r[1], r[2], r[3]) for r in con.execute(
+        "SELECT address, created, dead, backend FROM addr WHERE kind='temp'"
         " ORDER BY rowid DESC LIMIT 40")]
     con.close()
     got = 0
-    for a, created, dead in addrs:
-        if dead:
+    for a, created, dead, backend in addrs:
+        # 自有域名走 IMAP 收信，不用去供应商那里问
+        if dead or backend == OWN_BACKEND:
             continue
         gap = OLD_GAP
         if created:
