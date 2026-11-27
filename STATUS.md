@@ -19,6 +19,27 @@
 | 按钮全状态 | 可用 | 默认/悬停/按下/聚焦/禁用/进行中/成功/失败，锁宽度不跳布局 |
 | 移动端 390px | 可用 | 无横向溢出 |
 
+## 实测数字（本机同代码实例，非线上）
+
+| 项目 | 数字 | 条件 |
+|---|---|---|
+| 首屏到可交互 | 142 ms | `performance.mark('app-ready')`，TTFB 12 ms，DOMContentLoaded 110 ms |
+| 切换历史地址 | 21 ms | 命中本地缓存；0 滚动位移 |
+| 创建自有域名地址 | < 1.2 s | 含一次 `/api/newtemp` + 刷新 |
+| 新信到达 QQ → 入库 | 1.72 s | QQ 直投 + IMAP IDLE |
+| 新信到达 QQ → 页面出现 | 约 10.8 s – 48.3 s | 经 Cloudflare 转发回同一个 QQ；瓶颈是 CF→QQ 投递 |
+| 列表行内复制验证码 | < 250 ms | 剪贴板读回校验为真实值 |
+
+按钮尺寸实测：创建 112→112 px、列表验证码 77×22 三态不变、弹窗确认 88→88 px、账号「测试」41→41 px。
+
+## 线上状态（2026-11-27）
+
+- 服务器 `47.121.140.215:/opt/xinxia` 已更新并 `systemctl restart xinxia`，服务 active。
+- `ADMIN_PASS` 已从 systemd unit 删除，接口不再返回 401。
+- 源站直连（Host 头 + 443）返回正常页面和 `/api/state`。
+- **公网 https://agvuph.cn 目前返回 Cloudflare 525**：Cloudflare 连源站 TLS 握手失败，属于 Cloudflare 侧的 SSL 模式/回源配置问题，需要登录 Cloudflare 控制台把 SSL/TLS 改成 Full，或换成 Cloudflare Origin 证书。程序本身没有报错。
+- 原有 80 / 8766 / 8080 端口仍在监听，8766 与 8080 返回 200。
+
 ## 已知限制
 
 - **tempmail.lol 大陆基本不可用**：会加随机尾巴、限流、很快过期，只作备用。
