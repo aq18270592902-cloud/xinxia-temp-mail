@@ -32,13 +32,21 @@
 
 按钮尺寸实测：创建 112→112 px、列表验证码 77×22 三态不变、弹窗确认 88→88 px、账号「测试」41→41 px。
 
-## 线上状态（2026-11-27）
+## 线上状态（2026-11-27 更新）
 
-- 服务器 `47.121.140.215:/opt/xinxia` 已更新并 `systemctl restart xinxia`，服务 active。
+- 服务器 `47.121.140.215:/opt/xinxia` 已更新，`systemctl restart xinxia`，服务 active，`app.py` 与本地 md5 一致。
 - `ADMIN_PASS` 已从 systemd unit 删除，接口不再返回 401。
-- 源站直连（Host 头 + 443）返回正常页面和 `/api/state`。
-- **公网 https://agvuph.cn 目前返回 Cloudflare 525**：Cloudflare 连源站 TLS 握手失败，属于 Cloudflare 侧的 SSL 模式/回源配置问题，需要登录 Cloudflare 控制台把 SSL/TLS 改成 Full，或换成 Cloudflare Origin 证书。程序本身没有报错。
+- 源站 nginx 的 agvuph.cn 443 已改为只允许 TLSv1.2（原来 TLSv1.3 握手在 Cloudflare 回源时失败）。
+- **https://www.agvuph.cn 已恢复 200**：页面、app.css、`/api/newtemp` 均正常；用生产接口建了 `prodt@agvuph.cn`，从 QQ 发信后在生产库 `mail.db` 收到（约 22 秒，瓶颈仍是 Cloudflare→QQ 投递）。
+- **https://agvuph.cn（裸域）仍返回 Cloudflare 525**：同一台源站、同一个 443、Host 头直连正常，说明是 Cloudflare 针对裸域的回源配置问题（常见原因：裸域残留 AAAA 记录、Origin Rule/Configuration Rule 改了回源端口或 SSL 模式）。处理办法见下。
 - 原有 80 / 8766 / 8080 端口仍在监听，8766 与 8080 返回 200。
+
+### 裸域 525 的处理办法（需要 Cloudflare 控制台）
+
+1. DNS → 找到 `agvuph.cn` 的 AAAA 记录，删掉；只保留 A 记录指向 `47.121.140.215`，代理开启。
+2. Rules → Configuration Rules / Origin Rules：检查是否有只对 `agvuph.cn` 生效的规则，把回源端口改回 443、SSL 模式设为 Full。
+3. 最省事的兜底：Rules → Redirect Rules 增加 `https://agvuph.cn/*` → `https://www.agvuph.cn/$1`（301）。重定向在边缘完成，不依赖源站，裸域立刻可用。
+4. 想彻底走 Full (strict)：在 Cloudflare 生成 Origin Certificate，装到 `/etc/nginx/certs/`，再切 strict。自签证书在当前 Full 模式下已经够用。
 
 ## 已知限制
 
