@@ -6,6 +6,7 @@
 !web/**
 !blocklist.txt
 !README.md
+!STATUS.md
 !LICENSE
 !.gitignore
 !desktop/

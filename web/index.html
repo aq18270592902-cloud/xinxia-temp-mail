@@ -120,24 +120,16 @@
   <div class="page-head">
     <a class="page-back" id="backHome" href="#">← 临时邮箱</a>
     <h1>我的邮箱</h1>
-    <p class="page-lede">接入自己的 QQ / Gmail，在这里收信、读信、复制验证码。</p>
+    <p class="page-lede">接入自己的 QQ / Gmail，在这里收信、读信、复制验证码。不用登录，打开就能用。</p>
   </div>
-
-  <section class="acc-gate" id="accGate" hidden>
-    <h2>需要访问口令</h2>
-    <p class="hint">这一页是你自己的收信箱，输口令才能进。</p>
-    <form id="gateForm">
-      <input id="gatePass" type="password" placeholder="访问口令" autocomplete="current-password">
-      <button class="btn btn-primary" type="submit">进入</button>
-    </form>
-    <p class="hint" id="gateHint"></p>
-  </section>
 
   <div class="account-grid" id="accBody">
     <aside class="acc-side">
       <div class="side-head">
         <h2>已接入</h2>
-        <button class="btn btn-quiet" id="accAddToggle" type="button">添加邮箱</button>
+        <div class="side-acts">
+          <button class="btn btn-quiet" id="accAddToggle" type="button">添加邮箱</button>
+        </div>
       </div>
       <div class="acc-list" id="accList"></div>
 

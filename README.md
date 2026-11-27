@@ -39,14 +39,12 @@ HOST=0.0.0.0 PORT=8080 python 邮箱中心.py --no-browser   # 公网 / 容器
 | `PORT` | `18899` | 监听端口 |
 | `DB_PATH` | 脚本同目录 `邮箱中心.db` | SQLite 数据库位置 |
 | `OWN_DOMAIN` | `agvuph.cn` | 自有收信域名，填了就出现在来源列表里 |
-| `ADMIN_PASS` | `agvuph-2026` | 「我的邮箱」和后台接口的访问口令，部署时务必改掉 |
 
-## 访客隔离与访问口令
+## 访客隔离
 
-- 每个浏览器一个随机会话（cookie `xsid`），新建的地址记在这个会话名下；列表、邮件、验证码、删除都按会话过滤，别人看不到，同名也不会串。
-- 首页对普通访客只返回他自己的地址和邮件；`accounts`、`main_codes` 只发给管理员。
-- 「我的邮箱」要先输口令（`ADMIN_PASS`），对应接口没口令一律 401，不是只在界面上藏。
-- 老数据（升级前没有会话归属的地址）会在管理员第一次登录时归到当前浏览器，避免看起来像丢了。
+- 每个浏览器一个随机会话（cookie `xsid`），新建的临时地址记在这个会话名下；列表、邮件、验证码、删除都按会话过滤，别人看不到，同名也不会串。
+- 首页对普通访客只返回他自己的临时地址和邮件；「我的邮箱」不需要口令，打开就能看（账号信件对所有人可见）。
+- 没有管理员账号，也没有 401 拦截；`accounts`、`main_codes` 直接随首页返回。
 
 也可以用 `--host` / `--port` 覆盖。
 
@@ -132,10 +130,10 @@ MIT
 
 只依赖 Windows 自带的 PowerShell 5 + WinForms，不用装 Python 或 pip 包。
 
-1. 复制 `desktop/config.example.json` 为 `desktop/config.json`，把 `AdminPass` 改成网站的访问口令（`ADMIN_PASS`）。
+1. 如果需要改服务器地址，复制 `desktop/config.example.json` 为 `desktop/config.json`，改 `BaseUrl` 即可（不用填口令）。
 2. 右键「以管理员身份运行」`desktop/install.bat`，或者：
    ```powershell
-   powershell -ExecutionPolicy Bypass -File .\desktop\install.ps1 -Pass 你的口令 -Url https://agvuph.cn
+   powershell -ExecutionPolicy Bypass -File .\desktop\install.ps1 -Url https://agvuph.cn
    ```
 3. 脚本会写配置、在「启动」文件夹放快捷方式（开机自启），并立刻启动一份。
 

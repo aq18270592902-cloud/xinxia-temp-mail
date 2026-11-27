@@ -1,6 +1,5 @@
 ﻿# 一键安装：写配置、开机自启、立即启动
 param(
-    [string]$Pass = "",
     [string]$Url = "https://agvuph.cn"
 )
 $ErrorActionPreference = 'Stop'
@@ -12,14 +11,8 @@ if (-not (Test-Path $cfg)) { Copy-Item $example $cfg }
 
 $obj = Get-Content $cfg -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($Url) { $obj.BaseUrl = $Url.TrimEnd('/') }
-if ($Pass) { $obj.AdminPass = $Pass }
+if ($null -ne $obj.PSObject.Properties['AdminPass']) { $obj.PSObject.Properties.Remove('AdminPass') }
 $obj | ConvertTo-Json | Set-Content $cfg -Encoding UTF8
-
-if (-not $obj.AdminPass) {
-    Write-Host "还没填口令。请打开 $cfg，把 AdminPass 改成网站访问口令后重跑本脚本。" -ForegroundColor Yellow
-    Write-Host "你也可以带参数运行： .\install.ps1 -Pass 你的口令" -ForegroundColor Yellow
-    exit 1
-}
 
 # 开机自启：启动文件夹放一个指向 notify.vbs 的快捷方式
 $vbs = Join-Path $dir 'notify.vbs'

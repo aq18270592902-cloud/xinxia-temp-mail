@@ -24,6 +24,7 @@ import json
 import os
 import random
 import re
+import socket
 import sqlite3
 import string
 import subprocess
@@ -34,6 +35,7 @@ import hashlib
 import urllib.error
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.header import decode_header
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -54,8 +56,9 @@ def web_file(name):
         return f.read()
 
 CODE_RES = [
-    re.compile(r"(?:verification code|your code|code is|passcode|otp)[^0-9A-Za-z]{0,24}([0-9]{4,8})", re.I),
-    re.compile(r"(?:验证码|校验码|动态码|确认码|激活码)[^0-9]{0,24}([0-9]{4,8})"),
+    re.compile(r"(?:verification code|your code|code is|passcode|otp|security code|login code)"
+               r"[^0-9A-Za-z]{0,80}([0-9]{4,8})", re.I),
+    re.compile(r"(?:验证码|校验码|动态码|确认码|激活码)[^0-9]{0,80}([0-9]{4,8})"),
     re.compile(r"\b([0-9]{6})\b"),
     re.compile(r"\b([0-9]{4,8})\b"),
 ]
@@ -215,9 +218,9 @@ def pick_link(text):
 # 所以这里只认有上下文的码，宁可漏，不能把订单号、年份当验证码。
 CODE_CONTEXT_RES = [
     re.compile(r"(?:verification code|your code|code is|passcode|otp|security code|login code)"
-               r"[^0-9A-Za-z]{0,24}([0-9]{4,8})", re.I),
-    re.compile(r"(?:验证码|校验码|动态码|确认码|激活码)[^0-9]{0,24}([0-9]{4,8})"),
-    re.compile(r"\b([0-9]{4,8})\b[^0-9]{0,16}(?:is your|is the)?[^0-9]{0,8}"
+               r"[^0-9A-Za-z]{0,80}([0-9]{4,8})", re.I),
+    re.compile(r"(?:验证码|校验码|动态码|确认码|激活码)[^0-9]{0,80}([0-9]{4,8})"),
+    re.compile(r"\b([0-9]{4,8})\b[^0-9]{0,60}(?:is your|is the)?[^0-9]{0,16}"
                r"(?:verification code|code|otp|验证码)", re.I),
 ]
 
@@ -225,8 +228,8 @@ CODE_CONTEXT_RES = [
 def pick_code_mail(subject, body):
     """给临时邮件抓验证码：先看主题，再看正文；抓不到就返回空，前端不显示复制按钮。"""
     s = (subject or "").strip()
-    b = body or ""
-    for text in (s, b[:4000]):
+    b = (body or "")[:20000]
+    for text in (s, b):
         for rex in CODE_CONTEXT_RES:
             m = rex.search(text)
             if m:
@@ -235,9 +238,9 @@ def pick_code_mail(subject, body):
     m = re.fullmatch(r"([0-9]{4,8})", s)
     if m:
         return m.group(1)
-    # 正文里光秃秃一串数字：只有整封信确实在讲验证码时才认
-    if CODE_HINT_RE.search(s + "\n" + b[:3000]):
-        m = re.search(r"\b([0-9]{4,8})\b", b[:3000])
+    # 正文里光秃秃一串数字：只有整封信确实在讲验证码时才认，优先 6 位
+    if CODE_HINT_RE.search(s + "\n" + b):
+        m = re.search(r"(?<![0-9])([0-9]{6})(?![0-9])", b) or re.search(r"(?<![0-9])([0-9]{4,8})(?![0-9])", b)
         if m:
             return m.group(1)
     return ""
@@ -295,6 +298,12 @@ def db():
         con.execute("ALTER TABLE addr ADD COLUMN dead_note TEXT")
     if "owner_sid" not in _cols:
         con.execute("ALTER TABLE addr ADD COLUMN owner_sid TEXT")
+    _mcols = [r[1] for r in con.execute("PRAGMA table_info(msg)")]
+    if "body_html" not in _mcols:
+        con.execute("ALTER TABLE msg ADD COLUMN body_html TEXT")
+    _acols = [r[1] for r in con.execute("PRAGMA table_info(account)")]
+    if "last_uid_junk" not in _acols:
+        con.execute("ALTER TABLE account ADD COLUMN last_uid_junk INTEGER DEFAULT 0")
     # 读列表 / 收信查重都按这几个列过滤，加索引免得数据涨了就慢
     con.execute("CREATE INDEX IF NOT EXISTS idx_addr_owner ON addr(owner_sid)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_addr_seen ON addr(seen_at)")
@@ -520,7 +529,81 @@ def body_text(msg):
     return txt
 
 
-def imap_connect(acc):
+def body_html(msg):
+    """取邮件里第一个 text/html 分段，原样返回。"""
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() != "text/html":
+                    continue
+                if (part.get_content_disposition() or "") == "attachment":
+                    continue
+                payload = part.get_payload(decode=True) or b""
+                cs = part.get_content_charset() or "utf-8"
+                return payload.decode(cs, errors="replace")
+        elif msg.get_content_type() == "text/html":
+            payload = msg.get_payload(decode=True) or b""
+            cs = msg.get_content_charset() or "utf-8"
+            return payload.decode(cs, errors="replace")
+    except Exception:
+        pass
+    return ""
+
+
+def _img_placeholder(m):
+    """图片换成同尺寸占位块：外链图不加载（防追踪），但布局不塌。"""
+    tag = m.group(0)
+    def _dim(attr):
+        hit = re.search(attr + r"""\s*=\s*["']?\s*(\d+)""", tag, flags=re.I)
+        return int(hit.group(1)) if hit else 0
+    w, h = _dim("width"), _dim("height")
+    if not w:
+        st = re.search(r"""style\s*=\s*["']([^"']*)["']""", tag, flags=re.I)
+        if st:
+            hit = re.search(r"width\s*:\s*(\d+)px", st.group(1), flags=re.I)
+            if hit:
+                w = int(hit.group(1))
+    if not h:
+        st = re.search(r"""style\s*=\s*["']([^"']*)["']""", tag, flags=re.I)
+        if st:
+            hit = re.search(r"height\s*:\s*(\d+)px", st.group(1), flags=re.I)
+            if hit:
+                h = int(hit.group(1))
+    if not w and not h:
+        w, h = 240, 120
+    elif not w:
+        w = 240
+    elif not h:
+        h = max(60, int(w * 0.5))
+    w = min(w, 760)
+    h = min(h, 900)
+    return ('<span style="display:inline-flex;align-items:center;justify-content:center;'
+            'width:%dpx;height:%dpx;max-width:100%%;background:#f2efe8;border:1px solid #e6e1d6;'
+            'border-radius:4px;color:#a49c8e;font:12px sans-serif">图片</span>' % (w, h))
+
+
+def clean_email_html(raw):
+    """邮件 HTML 清洗：去脚本/表单/外链脚本，事件属性清零，图片换占位。
+    真正的隔离靠前端 iframe sandbox，这里只做基础减害。"""
+    if not raw:
+        return ""
+    h = raw
+    h = re.sub(r"<script[\s\S]*?</script\s*>", "", h, flags=re.I)
+    h = re.sub(r"<(iframe|object|embed|applet|frame|frameset|form|input|button|select|textarea|meta|link|base)\b[^>]*>",
+               "", h, flags=re.I)
+    h = re.sub(r"</(iframe|object|embed|applet|frame|frameset|form|input|button|select|textarea|meta|link|base)\s*>",
+               "", h, flags=re.I)
+    h = re.sub(r"""\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)""", "", h, flags=re.I)
+    h = re.sub(r"""((?:href|src)\s*=\s*)(["'])\s*javascript:[^"']*\2""", r'\1\2#\2', h, flags=re.I)
+    h = re.sub(r"<img\b[^>]*>", _img_placeholder, h, flags=re.I)
+    # 邮件常见「整页 height:100% / 100vh」会导致一片空白，收掉顶层固定高度
+    h = re.sub(r"(?i)(height\s*:\s*)100(?:\.0)?(?:%|vh|dvh|vw)", r"\1auto", h)
+    h = re.sub(r"(?i)(min-height\s*:\s*)100(?:\.0)?(?:%|vh|dvh)", r"\1 0", h)
+    h = re.sub(r"(<body[^>]*)\sheight\s*=\s*[\"']?\d+[\"']?", r"\1", h, flags=re.I)
+    return h
+
+
+def imap_connect(acc, timeout=8):
     host = acc["imap_host"]
     port = int(acc["imap_port"] or 993)
     user = acc["imap_user"] or acc["email"]
@@ -530,13 +613,13 @@ def imap_connect(acc):
     if not pwd:
         raise RuntimeError("这个邮箱还没填授权码，点「改码」补上")
     if port == 143:
-        m = imaplib.IMAP4(host, port, timeout=20)
+        m = imaplib.IMAP4(host, port, timeout=timeout)
         try:
             m.starttls()
         except Exception:
             pass
     else:
-        m = imaplib.IMAP4_SSL(host, port, timeout=20)
+        m = imaplib.IMAP4_SSL(host, port, timeout=timeout)
     m.login(user, pwd)
     # QQ / 163 不先发 ID 会报 Unsafe Login，发一下，失败也无所谓
     try:
@@ -567,10 +650,10 @@ def own_domain_recipient(msg):
     return ""
 
 
-def imap_scan(acc, known, limit=80):
+def imap_scan(acc, known, limit=80, timeout=8):
     """扫一个账号的新邮件，按收件人地址归位，抠验证码。返回 (新消息数, 错误)。"""
     try:
-        m = imap_connect(acc)
+        m = imap_connect(acc, timeout)
     except Exception as e:
         msg = _clean_err(e)[:180]
         # 连不上/密码错也要记下来，不然页面永远显示「未收过」看不出问题在哪
@@ -583,94 +666,14 @@ def imap_scan(acc, known, limit=80):
         except Exception:
             pass
         return 0, msg
-    found = 0
     try:
-        m.select("INBOX", readonly=True)
-
-        typ, data = m.uid("search", None, "ALL")
-        if typ != "OK":
-            return 0, "搜索失败"
-        uids = [int(x) for x in (data[0] or b"").split() if x.isdigit()]
-        last = int(acc.get("last_uid") or 0)
-        if last < 0:
-            # 刚加/刚改授权码：拿当前最大 UID 当基线，历史邮件不灌进来
-            base = max(uids) if uids else 0
-            con = db()
-            con.execute("UPDATE account SET last_uid=?, last_scan=?, last_error='' WHERE id=?",
-                        (base, now(), acc["id"]))
-            con.commit()
-            con.close()
-            return 0, ""
-        new = [u for u in uids if u > last][-limit:]
-        if not new:
-            con = db()
-            con.execute("UPDATE account SET last_scan=?, last_error='' WHERE id=?",
-                        (now(), acc["id"]))
-            con.commit()
-            con.close()
-            return 0, ""
-        known_lower = {a.lower(): a for a in known}
-        # 先把网络拉取和解析做完，最后一次性写库。边拉边写会让 SQLite 长期握着写锁，
-        # 后台临时邮箱扫描一写就报 database is locked。
-        parsed = []
-        for uid in new:
-            typ, raw = m.uid("fetch", str(uid), "(RFC822)")
-            if typ != "OK" or not raw or not raw[0]:
-                continue
-            try:
-                msg = email.message_from_bytes(raw[0][1])
-            except Exception:
-                continue
-            to_hdr = decode_mime(msg.get("To", ""))
-            own_to = own_domain_recipient(msg)
-            subj = decode_mime(msg.get("Subject", ""))
-            frm = decode_mime(msg.get("From", ""))
-            mdate = decode_mime(msg.get("Date", ""))
-            text = body_text(msg)
-            code = ""
-            if CODE_HINT_RE.search(subj + "\n" + text[:3000]):
-                code = pick_code_strict(text) or pick_code_strict(subj)
-            link = pick_link(text)
-            addrs = re.findall(r"[\w.+-]+@[\w.-]+\.\w+", to_hdr)
-            target = ""
-            # 自有域名优先：同一个 Gmail 下按原始收件人拆成不同地址，互相不串
-            if own_to:
-                target = own_to
-            else:
-                for a in addrs:
-                    if a.lower() in known_lower:
-                        target = known_lower[a.lower()]
-                        break
-            if not target:
-                target = acc["email"]
-            parsed.append({
-                "id": "%d:%d" % (acc["id"], uid), "target": target, "subj": subj,
-                "frm": frm, "mdate": mdate, "text": text, "code": code, "link": link,
-                "own": bool(own_to),
-            })
-        con = db()
+        n1, e1 = _imap_scan_conn(m, acc, known, limit)
+        # 转发过来的信经常被 QQ 丢进 Junk，这里只捡收件人是自有域名的
         try:
-            for p in parsed:
-                # Gmail 里新出现的前缀：补一条地址记录，历史列表里能直接看到
-                if p["own"]:
-                    con.execute(
-                        "INSERT OR IGNORE INTO addr(address,account_id,kind,backend,created)"
-                        " VALUES(?,?,?,?,?)",
-                        (p["target"], None, "temp", OWN_BACKEND, now()))
-                con.execute(
-                    "INSERT OR REPLACE INTO msg(id,address,account_id,subject,sender,mdate,body,code,link,fetched)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (p["id"], p["target"], acc["id"], p["subj"], p["frm"], p["mdate"],
-                     p["text"][:20000], p["code"], p["link"], now()))
-                if p["code"]:
-                    con.execute("UPDATE addr SET seen=?, seen_at=?, seen_subject=? WHERE address=?",
-                                (p["code"], now(), p["subj"][:120], p["target"]))
-            con.execute("UPDATE account SET last_uid=?, last_scan=?, last_error='' WHERE id=?",
-                        (max(new), now(), acc["id"]))
-            con.commit()
-        finally:
-            con.close()
-        found = len(parsed)
+            n2, e2 = _imap_scan_conn(m, acc, known, limit, "Junk", True)
+        except Exception:
+            n2, e2 = 0, ""
+        return n1 + n2, e1 or e2
     except Exception as e:
         try:
             con = db()
@@ -680,13 +683,109 @@ def imap_scan(acc, known, limit=80):
             con.close()
         except Exception:
             pass
-        return found, str(e)[:180]
+        return 0, str(e)[:180]
     finally:
         try:
             m.logout()
         except Exception:
             pass
-    return found, ""
+
+
+def _imap_scan_conn(m, acc, known, limit=80, folder="INBOX", junk_only=False):
+    """复用已连接的 IMAP 会话扫增量（IDLE 线程也走这里）。"""
+    found = 0
+    uid_field = "last_uid_junk" if junk_only else "last_uid"
+    typ, _ = m.select(folder, readonly=True)
+    if typ != "OK":
+        return 0, ""
+    typ, data = m.uid("search", None, "ALL")
+    if typ != "OK":
+        return 0, "搜索失败"
+    uids = [int(x) for x in (data[0] or b"").split() if x.isdigit()]
+    last = int(acc.get(uid_field) or 0)
+    if last < 0:
+        # 刚加/刚改授权码：拿当前最大 UID 当基线，历史邮件不灌进来
+        base = max(uids) if uids else 0
+        con = db()
+        con.execute("UPDATE account SET %s=?, last_scan=?, last_error='' WHERE id=?" % uid_field,
+                    (base, now(), acc["id"]))
+        con.commit()
+        con.close()
+        return 0, ""
+    new = [u for u in uids if u > last][-limit:]
+    if not new:
+        con = db()
+        con.execute("UPDATE account SET last_scan=?, last_error='' WHERE id=?",
+                    (now(), acc["id"]))
+        con.commit()
+        con.close()
+        return 0, ""
+    known_lower = {a.lower(): a for a in known}
+    # 先把网络拉取和解析做完，最后一次性写库。边拉边写会让 SQLite 长期握着写锁，
+    # 后台临时邮箱扫描一写就报 database is locked。
+    parsed = []
+    for uid in new:
+        typ, raw = m.uid("fetch", str(uid), "(RFC822)")
+        if typ != "OK" or not raw or not raw[0]:
+            continue
+        try:
+            msg = email.message_from_bytes(raw[0][1])
+        except Exception:
+            continue
+        to_hdr = decode_mime(msg.get("To", ""))
+        own_to = own_domain_recipient(msg)
+        if junk_only and not own_to:
+            continue
+        subj = decode_mime(msg.get("Subject", ""))
+        frm = decode_mime(msg.get("From", ""))
+        mdate = decode_mime(msg.get("Date", ""))
+        text = body_text(msg)
+        html_raw = body_html(msg)
+        code = ""
+        if CODE_HINT_RE.search(subj + "\n" + text[:20000]):
+            code = pick_code_strict(text) or pick_code_strict(subj)
+        link = pick_link(text)
+        addrs = re.findall(r"[\w.+-]+@[\w.-]+\.\w+", to_hdr)
+        target = ""
+        # 自有域名优先：同一个 Gmail 下按原始收件人拆成不同地址，互相不串
+        if own_to:
+            target = own_to
+        else:
+            for a in addrs:
+                if a.lower() in known_lower:
+                    target = known_lower[a.lower()]
+                    break
+        if not target:
+            target = acc["email"]
+        parsed.append({
+            "id": ("%d:j%d" % (acc["id"], uid)) if junk_only else ("%d:%d" % (acc["id"], uid)),
+            "target": target, "subj": subj,
+            "frm": frm, "mdate": mdate, "text": text, "html": html_raw, "code": code,
+            "link": link, "own": bool(own_to),
+        })
+    con = db()
+    try:
+        for p in parsed:
+            # Gmail 里新出现的前缀：补一条地址记录，历史列表里能直接看到
+            if p["own"]:
+                con.execute(
+                    "INSERT OR IGNORE INTO addr(address,account_id,kind,backend,created)"
+                    " VALUES(?,?,?,?,?)",
+                    (p["target"], None, "temp", OWN_BACKEND, now()))
+            con.execute(
+                "INSERT OR REPLACE INTO msg(id,address,account_id,subject,sender,mdate,body,body_html,code,link,fetched)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (p["id"], p["target"], acc["id"], p["subj"], p["frm"], p["mdate"],
+                 p["text"][:20000], p["html"][:200000], p["code"], p["link"], now()))
+            if p["code"]:
+                con.execute("UPDATE addr SET seen=?, seen_at=?, seen_subject=? WHERE address=?",
+                            (p["code"], now(), p["subj"][:120], p["target"]))
+        con.execute("UPDATE account SET %s=?, last_scan=?, last_error='' WHERE id=?" % uid_field,
+                    (max(new), now(), acc["id"]))
+        con.commit()
+    finally:
+        con.close()
+    return len(parsed), ""
 
 
 # ---------------------------------------------------------------- 临时邮箱后端
@@ -750,6 +849,7 @@ class TempMailIO:
                         "from": (it.get("from") or "").strip("<>"),
                         "date": it.get("created_at") or "",
                         "body": body.strip(),
+                        "html": html,
                         "code": pick_code_mail(subject, body),
                         "link": pick_link(body)})
         return out
@@ -882,6 +982,7 @@ class TempMailLol:
                 when = ts[:19].replace("T", " ")
             out.append({"subject": subject, "from": (it.get("from") or "").strip("<>"),
                         "date": when, "body": body,
+                        "html": raw if "<" in raw else "",
                         "code": pick_code_mail(subject, body),
                         "link": pick_link(body)})
         return out
@@ -983,18 +1084,10 @@ TEMP_BACKENDS = {
 OWN_DOMAIN = (os.environ.get("OWN_DOMAIN") or "agvuph.cn").strip().lower().lstrip("@")
 OWN_BACKEND = "owndomain"
 
-# ---- 访客隔离 / 管理口令 ------------------------------------------------
-# 每个浏览器一个随机 sid，地址入库时记下属于哪个 sid；读取一律按 sid 过滤。
+# ---- 访客隔离 ----------------------------------------------------------
+# 每个浏览器一个随机 sid，地址入库时记下属于哪个 sid；临时邮箱读取按 sid 过滤。
+# 「我的邮箱」不再需要口令，对所有访客开放。
 SID_COOKIE = "xsid"
-ADMIN_COOKIE = "xadm"
-
-
-def admin_pass():
-    return (os.environ.get("ADMIN_PASS") or "agvuph-2026").strip()
-
-
-def admin_token():
-    return hashlib.sha256(("xinxia-admin:" + admin_pass()).encode()).hexdigest()
 
 
 PASS_SYMBOLS = "!@#$%^&*-_=+?"
@@ -1225,18 +1318,14 @@ def acc_public():
     return out
 
 
-def list_addrs(owner_sid="", admin=False):
+def list_addrs(owner_sid=""):
     con = db()
     sql = ("SELECT a.address,a.account_id,a.kind,a.backend,a.tag,a.created,a.seen,a.seen_at,a.seen_subject,"
            " a.dead,a.dead_note,a.password,a.owner_sid,"
            " (SELECT email FROM account WHERE id=a.account_id) AS owner"
-           " FROM addr a")
-    args = ()
-    if not admin:
-        sql += " WHERE a.owner_sid=?"
-        args = (owner_sid,)
-    sql += " ORDER BY a.seen_at DESC, a.created DESC"
-    out = rows(con.execute(sql, args))
+           " FROM addr a WHERE a.owner_sid=?"
+           " ORDER BY a.seen_at DESC, a.created DESC")
+    out = rows(con.execute(sql, (owner_sid,)))
     con.close()
     bl = load_blocklist()
     for a in out:
@@ -1267,13 +1356,13 @@ def add_addrs(account_id, items, kind, tag=""):
     return made
 
 
-def remove_addr(address, sid="", admin=False):
+def remove_addr(address, sid=""):
     con = db()
     row = con.execute("SELECT owner_sid,kind FROM addr WHERE address=?", (address,)).fetchone()
     if not row:
         con.close()
         return False
-    if not admin and row[0] != sid:
+    if row[0] != sid:
         con.close()
         return False
     con.execute("DELETE FROM addr WHERE address=?", (address,))
@@ -1317,10 +1406,10 @@ def latest_codes(limit=30):
     return {"messages": out}
 
 
-def read_msgs(address, light=False, local=False, sid="", admin=False):
-    """light=True 时不带正文，给前端 3 秒轮询列表用；正文点开再单独取。
+def read_msgs(address, light=False, local=False, sid=""):
+    """light=True 时不带正文，给前端轮询列表用；正文点开再单独取。
     local=True 只读本地库、不碰供应商接口，用来切历史地址时先把已收邮件铺出来。
-    非管理员只能读自己会话建过的地址。"""
+    临时邮箱只能读自己会话建过的地址；「我的邮箱」里的账号信件公共可见。"""
     con = db()
     a = con.execute("SELECT address,backend,token,account_id,kind,owner_sid FROM addr WHERE address=?",
                     (address,)).fetchone()
@@ -1328,7 +1417,7 @@ def read_msgs(address, light=False, local=False, sid="", admin=False):
         con.close()
         return {"ok": False, "error": "没有这个地址"}
     address, backend, token, aid, kind, owner_sid = a
-    if not admin and owner_sid != sid:
+    if kind == "temp" and owner_sid != sid:
         con.close()
         return {"ok": False, "error": "没有这个地址"}
     if backend in TEMP_BACKENDS and not local:
@@ -1352,11 +1441,11 @@ def read_msgs(address, light=False, local=False, sid="", admin=False):
             mid = hashlib.sha1(("%s|%s|%s" % (address, mm.get("subject", ""),
                                               mm.get("date", ""))).encode("utf-8")).hexdigest()[:20]
             mm["id"] = mid
-            con.execute("INSERT OR IGNORE INTO msg(id,address,account_id,subject,sender,mdate,body,code,link,fetched)"
-                        " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            con.execute("INSERT OR IGNORE INTO msg(id,address,account_id,subject,sender,mdate,body,body_html,code,link,fetched)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (mid, address, None, _subject_text(mm.get("subject", "")), mm.get("from", ""),
-                         str(mm.get("date", "")), mm.get("body", ""), mm.get("code", ""),
-                         mm.get("link", ""), now()))
+                         str(mm.get("date", "")), mm.get("body", ""), mm.get("html", ""),
+                         mm.get("code", ""), mm.get("link", ""), now()))
         if live:
             con.commit()
         cols = ("id,subject,sender,mdate,substr(body,1,220) AS excerpt,code,link" if light
@@ -1390,19 +1479,21 @@ def read_msgs(address, light=False, local=False, sid="", admin=False):
             "codes": codes, "latest_code": codes[0] if codes else ""}
 
 
-def get_msg(mid, sid="", admin=False):
+def get_msg(mid, sid=""):
     con = db()
     hit = rows(con.execute(
-        "SELECT m.id,m.address,m.subject,m.sender,m.mdate,m.body,m.code,m.link,m.fetched,"
-        " a.owner_sid FROM msg m LEFT JOIN addr a ON a.address=m.address WHERE m.id=?",
+        "SELECT m.id,m.address,m.subject,m.sender,m.mdate,m.body,m.body_html,m.code,m.link,m.fetched,"
+        " a.owner_sid,a.kind FROM msg m LEFT JOIN addr a ON a.address=m.address WHERE m.id=?",
         (mid,)))
     con.close()
     if not hit:
         return {"ok": False, "error": "没有这封邮件"}
     row = hit[0]
-    if not admin and row.get("owner_sid") != sid:
+    if row.get("kind") == "temp" and row.get("owner_sid") != sid:
         return {"ok": False, "error": "没有这封邮件"}
     row.pop("owner_sid", None)
+    row.pop("kind", None)
+    row["html"] = clean_email_html(row.pop("body_html", "") or "")
     return {"ok": True, "message": row}
 
 
@@ -1634,6 +1725,26 @@ _IMAP_RUN_LOCK = threading.Lock()
 _ACC_BACKOFF = {}
 _ACC_LOCK = threading.Lock()
 
+# QQ 用 IMAP IDLE 实时推：这些账号由 idle 线程盯着，轮询就不必再连它。
+_IDLE_ACTIVE = set()
+_IDLE_LOCK = threading.Lock()
+_IDLE_STARTED = set()
+_IDLE_STATE = {}
+_IDLE_SUPERVISOR = None
+
+
+def _idle_mark(aid, on):
+    with _IDLE_LOCK:
+        if on:
+            _IDLE_ACTIVE.add(aid)
+        else:
+            _IDLE_ACTIVE.discard(aid)
+
+
+def _idle_is_active(aid):
+    with _IDLE_LOCK:
+        return aid in _IDLE_ACTIVE
+
 
 def _acc_ready(aid):
     with _ACC_LOCK:
@@ -1653,10 +1764,29 @@ def _acc_fail(aid):
         _ACC_BACKOFF[aid] = (time.time() + wait, fails)
 
 
+def _known_addrs(aid, email):
+    con = db()
+    ks = [r[0] for r in con.execute("SELECT address FROM addr WHERE account_id=?", (aid,))]
+    con.close()
+    return ks or [email]
+
+
+def _scan_one(acc):
+    try:
+        n, err = imap_scan(acc, _known_addrs(acc["id"], acc["email"]), timeout=7)
+        if err:
+            _acc_fail(acc["id"])
+        else:
+            _acc_ok(acc["id"])
+        return n, err
+    except Exception as e:
+        _acc_fail(acc["id"])
+        return 0, str(e)[:120]
+
+
 def scan_accounts_now(wait=0, force=False):
     """扫所有自己的 IMAP 邮箱。后台和手动共用，同一时刻只跑一份，免得重复登录、抢写锁。
-    wait 秒 = 愿意等后台那轮跑完再接手；0 = 拿不到锁就返回。
-    force=True（手动点刷新）时不理会退避，立刻重试。"""
+    QQ 并发扫、最多等 12 秒；Gmail 只丢到后台，不挡整轮。"""
     acquired = _IMAP_RUN_LOCK.acquire(timeout=wait) if wait else _IMAP_RUN_LOCK.acquire(blocking=False)
     if not acquired:
         return {"ok": False, "found": 0, "errors": ["正在收信，稍等"]}
@@ -1666,40 +1796,163 @@ def scan_accounts_now(wait=0, force=False):
         accs = rows(con.execute(
             "SELECT id,email,provider,imap_host,imap_port,imap_user,imap_pass,last_uid FROM account"))
         con.close()
-        # 自有域名的信走 QQ 最稳，先扫它；Gmail 链路时通时断，放最后，超时也不挡别人
-        accs.sort(key=lambda a: 0 if (a.get("provider") in ("qq", "foxmail")) else 1)
-        started = time.time()
+        fast, slow = [], []
         for acc in accs:
-            if time.time() - started > 45:
-                errs.append("本轮时间到，剩余账号下一轮再扫")
-                break
+            # IDLE 已经盯着的账号，轮询不再重复连
+            if _idle_is_active(acc["id"]):
+                continue
             if not force and not _acc_ready(acc["id"]):
                 continue
-            con = db()
-            known = [r[0] for r in con.execute(
-                "SELECT address FROM addr WHERE account_id=?", (acc["id"],))]
-            con.close()
+            if acc.get("provider") in ("qq", "foxmail"):
+                fast.append(acc)
+            else:
+                slow.append(acc)
+        if fast:
+            ex = ThreadPoolExecutor(max_workers=min(4, len(fast)))
+            futs = {ex.submit(_scan_one, a): a for a in fast}
             try:
-                n, err = imap_scan(acc, known or [acc["email"]])
-                got += n
-                if err:
-                    errs.append("%s：%s" % (acc["email"], err))
-                    _acc_fail(acc["id"])
-                else:
-                    _acc_ok(acc["id"])
-            except Exception as e:
-                errs.append("%s：%s" % (acc["email"], str(e)[:120]))
-                _acc_fail(acc["id"])
+                for f in as_completed(futs, timeout=12):
+                    n, err = f.result()
+                    got += n
+                    if err:
+                        errs.append("%s：%s" % (futs[f]["email"], err))
+            except Exception:
+                errs.append("QQ 本轮超时，下一轮继续")
+            finally:
+                ex.shutdown(wait=False)
+        # Gmail / 其他链路慢，扔后台；这一轮的返回值不等它
+        for acc in slow:
+            threading.Thread(target=_scan_one, args=(acc,), daemon=True).start()
         return {"ok": True, "found": got, "errors": errs}
     finally:
         _IMAP_RUN_LOCK.release()
 
 
+def _idle_loop(aid, stop_evt):
+    """QQ IMAP IDLE：服务器一喊 EXISTS，就立刻拉增量。断了自动重连。"""
+    fails = 0
+    while not stop_evt.is_set():
+        con = db()
+        row = con.execute(
+            "SELECT id,email,provider,imap_host,imap_port,imap_user,imap_pass,last_uid"
+            " FROM account WHERE id=?", (aid,)).fetchone()
+        con.close()
+        if not row:
+            break
+        cols = ("id", "email", "provider", "imap_host", "imap_port", "imap_user", "imap_pass", "last_uid")
+        acc = dict(zip(cols, row))
+        m = None
+        try:
+            m = imap_connect(acc, timeout=35)
+            m.select("INBOX", readonly=True)
+            _idle_mark(aid, True)
+            _acc_ok(aid)
+            fails = 0
+            _IDLE_STATE[aid] = {"at": now(), "ok": True, "event": "connected"}
+            # 连上先补一次，IDLE 期间漏掉的信也在这里找回来
+            _imap_scan_conn(m, acc, _known_addrs(aid, acc["email"]))
+            while not stop_evt.is_set():
+                # 上一轮可能查过 Junk，进 IDLE 前切回收件箱
+                m.select("INBOX", readonly=True)
+                tag = m._new_tag()
+                m.send(tag + b" IDLE\r\n")
+                while True:
+                    line = m.readline()
+                    if not line:
+                        raise IOError("IMAP 连接断了")
+                    if line.startswith(b"+"):
+                        break
+                changed = False
+                m.sock.settimeout(6)
+                try:
+                    while True:
+                        line = m.readline()
+                        if not line:
+                            raise IOError("IMAP 连接断了")
+                        up = line.upper()
+                        if b"EXISTS" in up or b"RECENT" in up:
+                            changed = True
+                            break
+                except socket.timeout:
+                    pass
+                finally:
+                    try:
+                        m.sock.settimeout(35)
+                    except Exception:
+                        pass
+                m.send(b"DONE\r\n")
+                while True:
+                    line = m.readline()
+                    if not line:
+                        raise IOError("IMAP 连接断了")
+                    if line.startswith(tag.strip()):
+                        break
+                if changed:
+                    _IDLE_STATE[aid] = {"at": now(), "ok": True, "event": "exists"}
+                    con = db()
+                    row = con.execute(
+                        "SELECT id,email,provider,imap_host,imap_port,imap_user,imap_pass,last_uid"
+                        " FROM account WHERE id=?", (aid,)).fetchone()
+                    con.close()
+                    if not row:
+                        break
+                    acc = dict(zip(cols, row))
+                    _imap_scan_conn(m, acc, _known_addrs(aid, acc["email"]))
+                # Junk 不会推 IDLE：每一轮顺手查一次，转发信常被 QQ 丢这里
+                try:
+                    con = db()
+                    row = con.execute(
+                        "SELECT id,email,provider,imap_host,imap_port,imap_user,imap_pass,last_uid"
+                        " FROM account WHERE id=?", (aid,)).fetchone()
+                    con.close()
+                    if row:
+                        acc = dict(zip(cols, row))
+                        _imap_scan_conn(m, acc, _known_addrs(aid, acc["email"]), 40, "Junk", True)
+                except Exception:
+                    pass
+        except Exception:
+            _idle_mark(aid, False)
+            _acc_fail(aid)
+            fails += 1
+            _IDLE_STATE[aid] = {"at": now(), "ok": False, "error": str(sys.exc_info()[1])[:140]}
+            if fails > 5:
+                break
+            stop_evt.wait(min(60, 5 * (2 ** (fails - 1))))
+        finally:
+            if m is not None:
+                try:
+                    m.logout()
+                except Exception:
+                    pass
+    _idle_mark(aid, False)
+    with _IDLE_LOCK:
+        _IDLE_STARTED.discard(aid)
+
+
+def idle_supervisor(stop_evt):
+    """盯账号表：QQ / foxmail 每个账号起一条 IDLE 线程，删号后线程自己退。"""
+    while not stop_evt.is_set():
+        try:
+            con = db()
+            ids = [r[0] for r in con.execute(
+                "SELECT id FROM account WHERE provider IN ('qq','foxmail')")]
+            con.close()
+            for aid in ids:
+                with _IDLE_LOCK:
+                    if aid in _IDLE_STARTED:
+                        continue
+                    _IDLE_STARTED.add(aid)
+                threading.Thread(target=_idle_loop, args=(aid, stop_evt), daemon=True).start()
+        except Exception:
+            pass
+        stop_evt.wait(30)
+
+
 def scan_imap(force=False):
     """扫所有 IMAP 账号。返回新抓到的邮件数。
     后台每 5 秒跑一轮，IMAP 默认 8 秒最多连一次；失败按账号退避。"""
-    gap = float(os.environ.get("IMAP_GAP") or 8)
-    if not force and time.time() - _IMAP_LAST[0] < max(5.0, gap):
+    gap = float(os.environ.get("IMAP_GAP") or 5)
+    if not force and time.time() - _IMAP_LAST[0] < max(4.0, gap):
         return 0
     _IMAP_LAST[0] = time.time()
     return scan_accounts_now(force=force).get("found", 0)
@@ -1710,15 +1963,32 @@ def scan_all(quiet=True, force=False):
         return {"ok": False, "error": "正在扫，稍等"}
     _SCAN_STATE["running"] = True
     total, errs = 0, []
+    out = {}
+
+    def run_temps():
+        try:
+            out["temp"] = scan_temps()
+        except Exception as e:
+            out["terr"] = "temp: %s" % str(e)[:100]
+
+    def run_imap():
+        try:
+            out["imap"] = scan_imap(force)
+        except Exception as e:
+            out["ierr"] = "imap: %s" % str(e)[:100]
+
     try:
-        try:
-            total += scan_temps()
-        except Exception as e:
-            errs.append("temp: %s" % str(e)[:100])
-        try:
-            total += scan_imap(force)
-        except Exception as e:
-            errs.append("imap: %s" % str(e)[:100])
+        # 临时邮箱和 IMAP 两条线并发跑：临时邮箱要挨个问供应商，串行会把 IMAP 拖到几十秒
+        t1 = threading.Thread(target=run_temps, daemon=True)
+        t2 = threading.Thread(target=run_imap, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join(20)
+        total += int(out.get("temp") or 0) + int(out.get("imap") or 0)
+        for k in ("terr", "ierr"):
+            if out.get(k):
+                errs.append(out[k])
         _SCAN_STATE.update({"last": now(), "found": total, "error": "; ".join(errs)[:300]})
         return {"ok": True, "found": total, "errors": errs}
     finally:
@@ -1822,7 +2092,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _auth(self):
-        """每个浏览器一个 sid；管理员靠 xadm cookie。"""
+        """每个浏览器一个 sid，用来隔离临时邮箱；「我的邮箱」不再需要登录。"""
         jar = {}
         for part in (self.headers.get("Cookie") or "").split(";"):
             if "=" in part:
@@ -1835,10 +2105,6 @@ class Handler(BaseHTTPRequestHandler):
             self._cookies.append(
                 "%s=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax" % (SID_COOKIE, sid))
         self.sid = sid
-        self.admin = (jar.get(ADMIN_COOKIE) or "") == admin_token()
-
-    def _deny_admin(self):
-        return self._send(401, {"error": "需要访问口令"})
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -1864,36 +2130,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, web_file("favicon.svg"), "image/svg+xml")
             if u.path == "/api/state":
                 return self._send(200, {
-                    "addrs": list_addrs(self.sid, self.admin),
-                    "accounts": acc_public() if self.admin else [],
-                    "scan": _SCAN_STATE if self.admin else {},
+                    "addrs": list_addrs(self.sid),
+                    "accounts": acc_public(),
+                    "scan": _SCAN_STATE,
+                    "idle": _IDLE_STATE,
                     "temps": temp_info(),
-                    "proxy": proxy_state() if self.admin else {},
-                    "main_codes": main_codes() if self.admin else [],
-                    "admin": self.admin,
+                    "proxy": proxy_state(),
+                    "main_codes": main_codes(),
+                    "admin": True,
                 })
             if u.path == "/api/providers":
                 return self._send(200, {"providers": provider_list()})
             if u.path == "/api/accounts":
-                if not self.admin:
-                    return self._deny_admin()
                 return self._send(200, {"accounts": acc_public()})
             if u.path == "/api/domains":
                 return self._send(200, {"temps": temp_info()})
-            if u.path == "/api/proxy":
-                if not self.admin:
-                    return self._deny_admin()
-                return self._send(200, proxy_state())
             if u.path == "/api/msgs":
                 light = (q.get("light") or ["0"])[0] in ("1", "true", "yes")
                 local = (q.get("local") or ["0"])[0] in ("1", "true", "yes")
-                return self._send(200, read_msgs((q.get("address") or [""])[0], light, local,
-                                                self.sid, self.admin))
+                return self._send(200, read_msgs((q.get("address") or [""])[0], light, local, self.sid))
             if u.path == "/api/msg":
-                return self._send(200, get_msg((q.get("id") or [""])[0], self.sid, self.admin))
+                return self._send(200, get_msg((q.get("id") or [""])[0], self.sid))
             if u.path == "/api/updates":
-                if not self.admin:
-                    return self._deny_admin()
                 return self._send(200, latest_codes())
             if u.path == "/api/check":
                 return self._send(200, check_domain((q.get("domain") or [""])[0]))
@@ -1907,72 +2165,25 @@ class Handler(BaseHTTPRequestHandler):
         self._auth()
         try:
             if u.path == "/api/login":
-                if (b.get("pass") or "").strip() == admin_pass():
-                    # 老数据没有 owner_sid，归到管理员当前这个浏览器，首页还能看见；
-                    # 其他访客永远看不到。
-                    con = db()
-                    con.execute("UPDATE addr SET owner_sid=? WHERE owner_sid IS NULL OR owner_sid=''",
-                                (self.sid,))
-                    con.commit()
-                    con.close()
-                    self._cookies.append(
-                        "%s=%s; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax"
-                        % (ADMIN_COOKIE, admin_token()))
-                    return self._send(200, {"ok": True})
-                return self._send(401, {"ok": False, "error": "口令不对"})
+                return self._send(200, {"ok": True})
             if u.path == "/api/logout":
-                self._cookies.append("%s=; Path=/; Max-Age=0" % ADMIN_COOKIE)
                 return self._send(200, {"ok": True})
             if u.path == "/api/scan":
-                if not self.admin:
-                    return self._deny_admin()
                 return self._send(200, scan_accounts_now(wait=25, force=True))
-            if u.path == "/api/proxy":
-                if not self.admin:
-                    return self._deny_admin()
-                set_proxy(b.get("proxy", ""))
-                return self._send(200, proxy_state())
-            if u.path == "/api/proxytest":
-                if not self.admin:
-                    return self._deny_admin()
-                return self._send(200, proxy_test())
             if u.path == "/api/newtemp":
                 made, errors = make_temp(int(b.get("n") or 1), b.get("prefix", ""),
                                          b.get("tag", ""), b.get("backend", ""),
                                          b.get("domain", ""), self.sid)
                 return self._send(200, {"made": made, "errors": errors})
-            if u.path == "/api/clear":
-                if not self.admin:
-                    return self._deny_admin()
-                # 只清临时邮箱那一批，长期账号要留着。
-                con = db()
-                keep = [r[0] for r in con.execute(
-                    "SELECT address FROM addr WHERE kind!='temp'")]
-                n = con.execute("SELECT COUNT(*) FROM addr WHERE kind='temp'").fetchone()[0]
-                con.execute("DELETE FROM addr WHERE kind='temp'")
-                if keep:
-                    q = ",".join("?" * len(keep))
-                    con.execute("DELETE FROM msg WHERE address NOT IN (%s)" % q, keep)
-                else:
-                    con.execute("DELETE FROM msg")
-                con.commit()
-                con.close()
-                return self._send(200, {"ok": True, "addrs": n})
             if u.path == "/api/rm":
-                return self._send(200, {"ok": remove_addr(b.get("address", ""), self.sid, self.admin)})
+                return self._send(200, {"ok": remove_addr(b.get("address", ""), self.sid)})
             if u.path == "/api/accadd":
-                if not self.admin:
-                    return self._deny_admin()
                 return self._send(200, acc_add(b.get("email", ""), b.get("provider", ""),
                                                 b.get("pass", ""), b.get("host", ""),
                                                 int(b.get("port") or 0)))
             if u.path == "/api/accrm":
-                if not self.admin:
-                    return self._deny_admin()
                 return self._send(200, {"ok": remove_account(int(b.get("id") or 0))})
             if u.path == "/api/acctest":
-                if not self.admin:
-                    return self._deny_admin()
                 ok, msg = acc_test(int(b.get("id") or 0))
                 return self._send(200, {"ok": ok, "msg": msg})
             return self._send(404, {"error": "not found"})
@@ -2020,6 +2231,7 @@ def main():
     stop_evt = threading.Event()
     t = threading.Thread(target=scan_worker, args=(stop_evt, max(3, args.interval)), daemon=True)
     t.start()
+    threading.Thread(target=idle_supervisor, args=(stop_evt,), daemon=True).start()
 
     url_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     url = "http://%s:%d" % (url_host, port)

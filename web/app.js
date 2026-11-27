@@ -47,24 +47,33 @@
   /* 居中确认弹窗，替代 window.confirm */
   var modalResolve = null;
   var modalFocus = null;
+  var modalTask = null;
 
   function askConfirm(opts) {
     if (modalResolve) { closeModal(false); }
     modalFocus = document.activeElement;
+    modalTask = typeof opts.task === "function" ? opts.task : null;
     $("modalTitle").textContent = opts.title || "确认";
     $("modalDesc").textContent = opts.desc || "";
-    $("modalOk").textContent = opts.okText || "确定";
-    $("modalOk").className = "btn " + (opts.danger === false ? "btn-primary" : "btn-danger");
+    var ok = $("modalOk");
+    clearTimeout(ok._doneT);
+    ok.className = "btn " + (opts.danger === false ? "btn-primary" : "btn-danger");
+    ok.textContent = opts.okText || "确定";
+    ok.style.width = "";
+    ok.removeAttribute("aria-busy");
+    delete ok.dataset.busy;
+    delete ok.dataset.origHtml;
     $("modal").hidden = false;
     document.body.classList.add("modal-on");
     $("modalCancel").focus();
     return new Promise(function (resolve) { modalResolve = resolve; });
   }
 
-  function closeModal(ok) {
+  function finishModal(ok) {
     if (!modalResolve) { return; }
     var resolve = modalResolve;
     modalResolve = null;
+    modalTask = null;
     $("modal").hidden = true;
     document.body.classList.remove("modal-on");
     if (modalFocus && modalFocus.focus) { modalFocus.focus(); }
@@ -72,25 +81,77 @@
     resolve(!!ok);
   }
 
+  function modalBusy() { return $("modalOk").dataset.busy === "1"; }
+
+  function closeModal(ok) {
+    if (modalBusy()) { return; }
+    finishModal(ok);
+  }
+
   function copyText(text, okMsg) {
-    function done() { toast(okMsg || "已复制"); }
-    function fallback() {
-      var ta = document.createElement("textarea");
-      ta.value = text;
-      ta.setAttribute("readonly", "");
-      ta.style.position = "fixed";
-      ta.style.top = "-1000px";
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); done(); }
-      catch (e) { toast("复制失败，请手动选中", true); }
-      document.body.removeChild(ta);
-    }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(fallback);
-    } else {
-      fallback();
-    }
+    return new Promise(function (resolve) {
+      function done() { toast(okMsg || "已复制"); resolve(true); }
+      function fail() { toast("复制失败，请手动选中", true); resolve(false); }
+      function fallback() {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+        document.body.removeChild(ta);
+        if (ok) { done(); } else { fail(); }
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(fallback);
+      } else {
+        fallback();
+      }
+    });
+  }
+
+  /* ---------- 按钮状态：默认 / 悬停 / 按下 / 聚焦 / 禁用 / 进行中 / 成功 / 失败
+     进行中锁宽度，文案再长也不会把按钮撑大或引起页面位移。 ---------- */
+
+  function btnBusy(btn, label) {
+    if (!btn || btn.dataset.busy === "1") { return false; }
+    clearTimeout(btn._doneT);
+    btn.dataset.busy = "1";
+    btn.dataset.origHtml = btn.innerHTML;
+    // 锁死外框尺寸：文字换了、宽度不变，页面不会抖
+    btn.style.width = btn.offsetWidth + "px";
+    btn.classList.remove("is-ok", "is-fail");
+    btn.classList.add("is-busy");
+    btn.setAttribute("aria-busy", "true");
+    if (label) { btn.textContent = label; }
+    return true;
+  }
+
+  function btnDone(btn, ok, label) {
+    if (!btn) { return; }
+    btn.classList.remove("is-busy");
+    btn.classList.add(ok ? "is-ok" : "is-fail");
+    if (label) { btn.textContent = label; }
+    clearTimeout(btn._doneT);
+    btn._doneT = setTimeout(function () {
+      btn.classList.remove("is-ok", "is-fail");
+      if (btn.dataset.origHtml != null) { btn.innerHTML = btn.dataset.origHtml; }
+      btn.style.width = "";
+      btn.removeAttribute("aria-busy");
+      delete btn.dataset.busy;
+      delete btn.dataset.origHtml;
+    }, ok ? 1200 : 1800);
+  }
+
+  function copyWith(btn, text, okMsg) {
+    if (!btn) { return; }
+    if (!btnBusy(btn, btn.classList.contains("m-copy") ? "" : "复制中…")) { return; }
+    copyText(text, okMsg).then(function (ok) {
+      btnDone(btn, ok, ok ? "已复制" : "复制失败");
+    });
   }
 
   function senderName(raw) {
@@ -214,15 +275,7 @@
 
   function renderAccountView() {
     if (state.view !== "accounts") { return; }
-    var gate = $("accGate");
     var body = $("accBody");
-    if (!state.admin) {
-      gate.hidden = false;
-      body.hidden = true;
-      $("gatePass").focus();
-      return;
-    }
-    gate.hidden = true;
     body.hidden = false;
     if (!state.accActive || !findAccount(state.accActive)) {
       state.accActive = state.accounts.length ? state.accounts[0].email : "";
@@ -308,8 +361,9 @@
     }
     if (!fallback) { fallback = list[0].key || list[0].name; }
     var names = list.map(function (t) { return t.key || t.name; });
-    var want = sel.value || localStorage.getItem(LS_PROV) || "";
-    sel.value = (want && names.indexOf(want) >= 0) ? want : fallback;
+    var saved = localStorage.getItem(LS_PROV) || "";
+    var want = (saved && names.indexOf(saved) >= 0) ? saved : "";
+    sel.value = want || fallback;
     localStorage.setItem(LS_PROV, sel.value);
     updatePrefixHint();
   }
@@ -406,7 +460,7 @@
 
   // 先读本地库：切地址时立刻有内容，供应商那边慢或限流都不影响这一步
   function loadLocalMsgs(address) {
-    fetch("/api/msgs?address=" + encodeURIComponent(address) + "&light=1&local=1")
+    return fetch("/api/msgs?address=" + encodeURIComponent(address) + "&light=1&local=1")
       .then(function (r) { return r.json(); })
       .then(function (j) {
         if (state.active !== address || !j.ok) { return; }
@@ -503,9 +557,7 @@
       btn.appendChild(copyIcon());
       btn.addEventListener("click", function (e) {
         e.stopPropagation();
-        copyText(m.code, "验证码已复制");
-        btn.classList.add("done");
-        setTimeout(function () { btn.classList.remove("done"); }, 1200);
+        copyWith(btn, m.code, "验证码已复制");
       });
       line.appendChild(btn);
     }
@@ -649,9 +701,7 @@
       btn.appendChild(digits);
       btn.appendChild(copyIcon());
       btn.addEventListener("click", function () {
-        copyText(m.code, "验证码已复制");
-        btn.classList.add("done");
-        setTimeout(function () { btn.classList.remove("done"); }, 1200);
+        copyWith(btn, m.code, "验证码已复制");
       });
 
       var time = document.createElement("span");
@@ -672,6 +722,37 @@
     readerEl.hidden = true;
     readerEl.textContent = "";
   }
+
+  function htmlDoc(html) {
+    var reset = "<style>"
+      + "html,body{margin:0;padding:0;background:#fff;color:#1a1815;height:auto!important;min-height:0!important}"
+      + "body{font:14px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
+      + "word-break:break-word;overflow-x:hidden}"
+      + "table{border-collapse:collapse;max-width:100%!important}"
+      + "img{max-width:100%!important}"
+      + "a{color:#2a574c}"
+      + "</style>";
+    var script = "<script>(function(){function r(){try{var h=Math.max(document.documentElement.scrollHeight,"
+      + "document.body.scrollHeight);parent.postMessage({t:'xx-h',h:h},'*')}catch(e){}}"
+      + "r();window.addEventListener('load',r);setTimeout(r,120);setTimeout(r,600);"
+      + "if(window.ResizeObserver){new ResizeObserver(r).observe(document.body)}else{setInterval(r,1200)}})();"
+      + "<\/script>";
+    return "<!doctype html><html><head><meta charset='utf-8'>"
+      + "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'; "
+      + "script-src 'unsafe-inline'; img-src data:;\">"
+      + reset + "</head><body>" + html + script + "</body></html>";
+  }
+
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.t !== "xx-h") { return; }
+    var frames = document.querySelectorAll("iframe.reader-html");
+    for (var i = 0; i < frames.length; i++) {
+      if (e.source === frames[i].contentWindow) {
+        var h = parseInt(e.data.h, 10) || 0;
+        if (h > 0) { frames[i].style.height = Math.min(2600, Math.max(120, h + 2)) + "px"; }
+      }
+    }
+  });
 
   function openMessage(id, listEl, readerEl) {
     markRead(id);
@@ -713,17 +794,27 @@
         btn.type = "button";
         btn.className = "btn btn-dark";
         btn.textContent = "复制验证码";
-        btn.addEventListener("click", function () { copyText(m.code, "验证码已复制"); });
+        btn.addEventListener("click", function () { copyWith(btn, m.code, "验证码已复制"); });
         box.appendChild(lab);
         box.appendChild(strong);
         box.appendChild(btn);
         readerEl.appendChild(box);
       }
 
-      var body = document.createElement("pre");
-      body.className = "reader-body";
-      body.textContent = m.body || "（这封邮件没有可显示的正文）";
-      readerEl.appendChild(body);
+      if (m.html) {
+        var frame = document.createElement("iframe");
+        frame.className = "reader-html";
+        frame.setAttribute("sandbox", "allow-scripts");
+        frame.setAttribute("title", "邮件正文");
+        frame.style.height = "320px";
+        frame.srcdoc = htmlDoc(m.html);
+        readerEl.appendChild(frame);
+      } else {
+        var body = document.createElement("pre");
+        body.className = "reader-body";
+        body.textContent = m.body || "（这封邮件没有可显示的正文）";
+        readerEl.appendChild(body);
+      }
 
       // 换到读信视图时锁住容器高度，页面不会因为列表被收起而整体上跳
       var holder = listEl.parentNode;
@@ -745,13 +836,16 @@
     showPane($("msgList"), $("reader"));
     renderMsgs();
     if (address) {
-      loadLocalMsgs(address);
+      var p = loadLocalMsgs(address);
       pollMsgs();
+      return p;
     }
+    return Promise.resolve();
   }
 
-  function generate() {
-    var btn = $("mkTemp");
+  function generate(btn) {
+    btn = btn || $("mkTemp");
+    if (btn.dataset.busy === "1") { return; }
     var backend = $("genProv").value || "";
     if (!backend) {
       toast("先选一个服务商", true);
@@ -763,8 +857,7 @@
       $("genPrefix").focus();
       return;
     }
-    btn.disabled = true;
-    btn.textContent = "创建中…";
+    if (!btnBusy(btn, "创建中…")) { return; }
     fetch("/api/newtemp", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -772,31 +865,25 @@
     }).then(function (r) { return r.json(); }).then(function (j) {
       var made = j.made || [], errs = j.errors || [];
       if (!made.length) {
+        btnDone(btn, false, "创建失败");
         toast(errs[0] || "生成失败，换一次试试", true);
         return;
       }
       $("genPrefix").value = "";
+      btnDone(btn, true, "已创建");
       return fetchState().then(function () { setActive(made[0].address); });
     }).catch(function () {
+      btnDone(btn, false, "创建失败");
       toast("创建失败", true);
-    }).then(function () {
-      btn.disabled = false;
-      btn.textContent = "创建邮箱";
     });
   }
 
   /* ---------- 手动刷新 / 删除 ---------- */
 
-  function spin(btn, on) {
-    btn.classList.toggle("busy", !!on);
-    btn.disabled = !!on;
-  }
-
   function refreshInbox() {
     var btn = $("refreshNow");
-    if (!state.active || btn.disabled) { return; }
+    if (!state.active || !btnBusy(btn, "")) { return; }
     var addr = state.active;
-    spin(btn, true);
     fetch("/api/msgs?address=" + encodeURIComponent(addr) + "&light=1")
       .then(function (r) { return r.json(); })
       .then(function (j) {
@@ -811,23 +898,29 @@
           noteEl.hidden = true;
           noteEl.title = "";
         }
-        if (!j.ok) { toast(j.error || "刷新失败", true); return; }
+        if (!j.ok) {
+          btnDone(btn, false, "");
+          toast(j.error || "刷新失败", true);
+          return;
+        }
         state.msgs = j.messages || [];
         state.msgPending = false;
         cachePut(addr, state.msgs);
         state.sig = sigOf(state.msgs);
         renderMsgs();
         if (j.dead) { fetchState(); }
+        btnDone(btn, true, "");
         toast(note ? "已刷新" : "已是最新");
       })
-      .catch(function () { toast("刷新失败", true); })
-      .then(function () { spin(btn, false); });
+      .catch(function () {
+        btnDone(btn, false, "");
+        toast("刷新失败", true);
+      });
   }
 
   function refreshAccount() {
     var btn = $("accRefresh");
-    if (!state.accActive || btn.disabled) { return; }
-    spin(btn, true);
+    if (!state.accActive || !btnBusy(btn, "")) { return; }
     fetch("/api/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -835,12 +928,15 @@
     }).then(function (r) { return r.json(); }).then(function (j) {
       if (j.errors && j.errors.length) { toast(j.errors[0], true); }
       else { toast(j.found ? ("收到 " + j.found + " 封新邮件") : "已是最新"); }
+      btnDone(btn, !(j.errors && j.errors.length), "");
       var email = state.accActive;
       return fetchState().then(function () {
         if (state.accActive === email) { return fetchAccMsgs(); }
       });
-    }).catch(function () { toast("刷新失败", true); })
-      .then(function () { spin(btn, false); });
+    }).catch(function () {
+      btnDone(btn, false, "");
+      toast("刷新失败", true);
+    });
   }
 
   function deleteAddr() {
@@ -849,38 +945,38 @@
     askConfirm({
       title: "删除这个地址",
       desc: "删除 " + addr + "？本地记录和已收邮件会一起删掉，服务商那边的信箱不受影响。",
-      okText: "删除"
-    }).then(function (ok) {
-      if (!ok) { return; }
-      var btn = $("delAddr");
-      btn.disabled = true;
-      fetch("/api/rm", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: addr })
-      }).then(function (r) { return r.json(); }).then(function (j) {
-        if (!j.ok) { toast("删除失败", true); return; }
-        delete LOCAL_CACHE[addr];
-        state.addrs = state.addrs.filter(function (a) { return a.address !== addr; });
-        localStorage.removeItem(LS_KEY);
-        state.active = "";
-        state.msgs = [];
-        state.sig = "";
-        state.msgPending = false;
-        showPane($("msgList"), $("reader"));
-        renderMsgs();
-        renderMailbox();
-        var next = "";
-        for (var i = 0; i < state.addrs.length; i++) {
-          if (!state.addrs[i].dead) { next = state.addrs[i].address; break; }
-        }
-        if (!next && state.addrs.length) { next = state.addrs[0].address; }
-        toast("已删除");
-        if (next) { setActive(next); }
-        fetchState();
-      }).catch(function () { toast("删除失败", true); })
-        .then(function () { btn.disabled = false; });
+      okText: "删除",
+      task: function () { return doDeleteAddr(addr); }
     });
+  }
+
+  function doDeleteAddr(addr) {
+    return fetch("/api/rm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address: addr })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j.ok) { toast("删除失败", true); return false; }
+      delete LOCAL_CACHE[addr];
+      state.addrs = state.addrs.filter(function (a) { return a.address !== addr; });
+      localStorage.removeItem(LS_KEY);
+      state.active = "";
+      state.msgs = [];
+      state.sig = "";
+      state.msgPending = false;
+      showPane($("msgList"), $("reader"));
+      renderMsgs();
+      renderMailbox();
+      var next = "";
+      for (var i = 0; i < state.addrs.length; i++) {
+        if (!state.addrs[i].dead) { next = state.addrs[i].address; break; }
+      }
+      if (!next && state.addrs.length) { next = state.addrs[0].address; }
+      toast("已删除");
+      if (next) { setActive(next); }
+      fetchState();
+      return true;
+    }).catch(function () { toast("删除失败", true); return false; });
   }
 
   /* ---------- 我的邮箱 ---------- */
@@ -1087,19 +1183,18 @@
   }
 
   function testAccount(id, btn) {
-    var old = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "测试中";
+    if (!btnBusy(btn, "测试中")) { return; }
     fetch("/api/acctest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: id })
     }).then(function (r) { return r.json(); }).then(function (j) {
       toast(j.ok ? "连接正常" : ("连不上：" + (j.msg || "")), !j.ok);
-      return fetchState();
-    }).catch(function () { toast("测试失败", true); }).then(function () {
-      btn.disabled = false;
-      btn.textContent = old;
+      btnDone(btn, !!j.ok, j.ok ? "正常" : "失败");
+      setTimeout(fetchState, 1300);
+    }).catch(function () {
+      toast("测试失败", true);
+      btnDone(btn, false, "失败");
     });
   }
 
@@ -1107,16 +1202,14 @@
     askConfirm({
       title: "删除这个邮箱",
       desc: "删除 " + a.email + "？本地保存的授权码和收信记录会一起删掉。",
-      okText: "删除"
-    }).then(function (ok) {
-      if (!ok) { return; }
-      fetch("/api/accrm", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: a.id })
-      }).then(function (r) { return r.json(); }).then(function (j) {
-        toast(j.ok ? "已删除" : "删除失败", !j.ok);
-        if (j.ok) {
+      okText: "删除",
+      task: function () {
+        return fetch("/api/accrm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: a.id })
+        }).then(function (r) { return r.json(); }).then(function (j) {
+          if (!j.ok) { toast("删除失败", true); return false; }
           delete LOCAL_CACHE[a.email];
           if (state.accActive === a.email) {
             state.accActive = "";
@@ -1124,9 +1217,11 @@
             state.accSig = "";
             state.accPending = false;
           }
-        }
-        return fetchState();
-      }).catch(function () { toast("删除失败", true); });
+          toast("已删除");
+          fetchState();
+          return true;
+        }).catch(function () { toast("删除失败", true); return false; });
+      }
     });
   }
 
@@ -1139,36 +1234,39 @@
     if (!pass) { toast("要填授权码", true); return; }
 
     var btn = $("aGo");
-    btn.disabled = true;
-    btn.textContent = "连接中…";
+    if (!btnBusy(btn, "连接中…")) { return; }
     fetch("/api/accadd", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: email, provider: provider, pass: pass })
     }).then(function (r) { return r.json(); }).then(function (j) {
-      if (j.error) { toast(j.error, true); return; }
+      if (j.error) { btnDone(btn, false, "连接失败"); toast(j.error, true); return; }
       if (j.ok) {
         toast(j.msg || "已连接");
+        btnDone(btn, true, "已连接");
         $("aPass").value = "";
         $("aEmail").value = "";
-        $("accForm").hidden = true;
         state.accActive = email;
         localStorage.setItem(LS_ACC, email);
+        setTimeout(function () {
+          $("accForm").hidden = true;
+          fetchState().then(function () {
+            if (findAccount(email)) { selectAccount(email); }
+          });
+        }, 700);
       } else {
+        btnDone(btn, false, "连接失败");
         toast("连不上：" + (j.msg || ""), true);
       }
-      return fetchState().then(function () {
-        if (j.ok && findAccount(email)) { selectAccount(email); }
-      });
-    }).catch(function () { toast("连接失败", true); }).then(function () {
-      btn.disabled = false;
-      btn.textContent = "保存并连接";
+    }).catch(function () {
+      btnDone(btn, false, "连接失败");
+      toast("连接失败", true);
     });
   }
 
   /* ---------- 事件 ---------- */
 
-  $("mkTemp").addEventListener("click", generate);
+  $("mkTemp").addEventListener("click", function () { generate(); });
   $("rebuild").addEventListener("click", function () {
     var meta = findAddr(state.active);
     var sel = $("genProv");
@@ -1176,36 +1274,29 @@
       sel.value = meta.backend;
       localStorage.setItem(LS_PROV, meta.backend);
     }
-    generate();
+    generate($("rebuild"));
   });
   $("copyAddr").addEventListener("click", function () {
-    if (state.active) { copyText(state.active, "地址已复制"); }
+    if (state.active) { copyWith($("copyAddr"), state.active, "地址已复制"); }
   });
   $("copyPass").addEventListener("click", function () {
     var meta = findAddr(state.active);
-    if (meta && meta.password) { copyText(meta.password, "密码已复制"); }
-  });
-  $("gateForm").addEventListener("submit", function (e) {
-    e.preventDefault();
-    var p = ($("gatePass").value || "").trim();
-    if (!p) { $("gateHint").textContent = "先输口令"; return; }
-    $("gateHint").textContent = "";
-    fetch("/api/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pass: p })
-    }).then(function (r) { return r.json().then(function (j) { return { code: r.status, j: j }; }); })
-      .then(function (res) {
-        if (!res.j.ok) {
-          $("gateHint").textContent = "口令不对";
-          return;
-        }
-        $("gatePass").value = "";
-        return fetchState().then(function () { renderAccountView(); });
-      }).catch(function () { $("gateHint").textContent = "网络不通，再试一次"; });
+    if (meta && meta.password) { copyWith($("copyPass"), meta.password, "密码已复制"); }
   });
   $("addrSwitch").addEventListener("change", function () {
-    if (this.value) { setActive(this.value); }
+    var sel = this;
+    if (!sel.value) { return; }
+    sel.classList.add("is-busy");
+    sel.setAttribute("aria-busy", "true");
+    var p = setActive(sel.value) || Promise.resolve();
+    var t0 = Date.now();
+    Promise.resolve(p).then(function () {
+      var wait = Math.max(0, 200 - (Date.now() - t0));
+      setTimeout(function () {
+        sel.classList.remove("is-busy");
+        sel.removeAttribute("aria-busy");
+      }, wait);
+    });
   });
   $("genProv").addEventListener("change", function () {
     localStorage.setItem(LS_PROV, this.value);
@@ -1247,7 +1338,18 @@
   });
   $("modalCancel").addEventListener("click", function () { closeModal(false); });
   $("modalMask").addEventListener("click", function () { closeModal(false); });
-  $("modalOk").addEventListener("click", function () { closeModal(true); });
+  $("modalOk").addEventListener("click", function () {
+    var btn = this;
+    if (!modalTask) { closeModal(true); return; }
+    if (!btnBusy(btn, "处理中")) { return; }
+    var p;
+    try { p = modalTask(); } catch (e) { p = Promise.reject(e); }
+    Promise.resolve(p).then(function (ok) {
+      if (ok === false) { btnDone(btn, false, "失败"); return; }
+      btnDone(btn, true, "完成");
+      setTimeout(function () { finishModal(true); }, 420);
+    }, function () { btnDone(btn, false, "失败"); });
+  });
   document.addEventListener("keydown", function (e) {
     if (!$("modal").hidden && e.key === "Escape") {
       e.preventDefault();
@@ -1282,8 +1384,10 @@
   fetchState().then(function () {
     pollMsgs();
     if (location.hash === "#me") { showView("accounts", false); }
+    // 首屏可交互时刻，留给性能实测读取
+    try { if (window.performance && performance.mark) { performance.mark("app-ready"); } } catch (e) {}
   });
-  setInterval(pollMsgs, 3000);
-  setInterval(pollAccMsgs, 3000);
-  setInterval(fetchState, 5000);
+  setInterval(pollMsgs, 1500);
+  setInterval(pollAccMsgs, 1500);
+  setInterval(fetchState, 4000);
 })();

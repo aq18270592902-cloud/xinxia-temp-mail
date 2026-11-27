@@ -13,12 +13,11 @@ if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir |
 $SeenPath = Join-Path $StateDir 'seen.json'
 Add-Content (Join-Path $StateDir 'debug.log') -Value ((Get-Date -Format 'HH:mm:ss') + ' start ' + $ScriptDir)
 
-$Cfg = @{ BaseUrl = 'https://agvuph.cn'; AdminPass = ''; PollSeconds = 5 }
+$Cfg = @{ BaseUrl = 'https://agvuph.cn'; PollSeconds = 5 }
 if (Test-Path $CfgPath) {
     try {
         $raw = Get-Content $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($raw.BaseUrl) { $Cfg.BaseUrl = $raw.BaseUrl.TrimEnd('/') }
-        if ($null -ne $raw.AdminPass) { $Cfg.AdminPass = [string]$raw.AdminPass }
         if ($raw.PollSeconds) { $Cfg.PollSeconds = [int]$raw.PollSeconds }
     } catch {}
 }
@@ -47,29 +46,25 @@ $script:NextTry = [DateTime]::MinValue
 $script:Queue = New-Object System.Collections.Queue
 $script:Popup = $null
 $script:Paused = $false
-
-function Login {
-    if (-not $Cfg.AdminPass) { throw 'config.json 里还没填 AdminPass' }
-    $body = @{ pass = $Cfg.AdminPass } | ConvertTo-Json
-    $script:Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-    Invoke-RestMethod -Uri "$($Cfg.BaseUrl)/api/login" -Method Post -Body $body `
-        -ContentType 'application/json' -WebSession $script:Session -TimeoutSec 15 | Out-Null
-    $script:LoggedIn = $true
-}
+$script:CopyBtn = $null
+$script:CopyTimer = New-Object System.Windows.Forms.Timer
+$script:CopyTimer.Interval = 1200
+$script:CopyTimer.Add_Tick({
+    $script:CopyTimer.Stop()
+    $b = $script:CopyBtn
+    if ($b -and -not $b.IsDisposed) {
+        $b.Text = '复制验证码'
+        $b.BackColor = [System.Drawing.Color]::FromArgb(42, 87, 76)
+        $b.ForeColor = [System.Drawing.Color]::White
+        $b.Enabled = $true
+    }
+})
 
 function Fetch-Updates {
     if ($script:Paused) { return }
     if ([DateTime]::Now -lt $script:NextTry) { return }
     try {
-        if (-not $script:LoggedIn) { Login }
-        try {
-            $res = Invoke-RestMethod -Uri "$($Cfg.BaseUrl)/api/updates" -WebSession $script:Session -TimeoutSec 12
-        } catch {
-            $code = 0
-            try { $code = [int]$_.Exception.Response.StatusCode } catch {}
-            if ($code -eq 401) { $script:LoggedIn = $false; Login; $res = Invoke-RestMethod -Uri "$($Cfg.BaseUrl)/api/updates" -WebSession $script:Session -TimeoutSec 12 }
-            else { throw }
-        }
+        $res = Invoke-RestMethod -Uri "$($Cfg.BaseUrl)/api/updates" -TimeoutSec 12
         $list = @($res.messages)
         if ($script:FirstRun) {
             $list | ForEach-Object { $script:Seen[[string]$_.id] = $true }
@@ -184,8 +179,30 @@ function Show-Next {
     $copy.ForeColor = [System.Drawing.Color]::White
     $copy.FlatAppearance.BorderSize = 0
     $copy.Add_Click({
-        try { [System.Windows.Forms.Clipboard]::SetText([string]$m.code); $copy.Text = '已复制' } catch {}
+        $want = [string]$m.code
+        $ok = $false
+        try {
+            # 先清空再写入，写完立刻读回来比对，不靠“调用过就成功”
+            [System.Windows.Forms.Clipboard]::Clear()
+            [System.Windows.Forms.Clipboard]::SetText($want)
+            $got = [System.Windows.Forms.Clipboard]::GetText()
+            $ok = ($got -eq $want)
+        } catch { $ok = $false }
+        if ($ok) {
+            $copy.Text = '已复制'
+            $copy.BackColor = [System.Drawing.Color]::FromArgb(42, 87, 76)
+        } else {
+            $copy.Text = '复制失败'
+            $copy.BackColor = [System.Drawing.Color]::FromArgb(162, 75, 51)
+        }
+        $copy.ForeColor = [System.Drawing.Color]::White
+        $copy.Enabled = $false
+        $script:CopyBtn = $copy
+        $script:CopyTimer.Stop()
+        $script:CopyTimer.Start()
     })
+    $copy.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(31, 67, 58)
+    $copy.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(24, 57, 47)
     $bar.Controls.Add($copy)
 
     $open = New-Object System.Windows.Forms.Button
@@ -198,6 +215,8 @@ function Show-Next {
     $open.BackColor = [System.Drawing.Color]::White
     $open.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(214, 222, 218)
     $open.Add_Click({ Start-Process ($Cfg.BaseUrl + '/#me') })
+    $open.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(250, 248, 243)
+    $open.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(241, 237, 228)
     $bar.Controls.Add($open)
 
     $close = New-Object System.Windows.Forms.Button
@@ -210,6 +229,8 @@ function Show-Next {
     $close.BackColor = [System.Drawing.Color]::White
     $close.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(214, 222, 218)
     $close.Add_Click({ $f.Close() })
+    $close.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(250, 248, 243)
+    $close.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(241, 237, 228)
     $bar.Controls.Add($close)
 
     $timer = New-Object System.Windows.Forms.Timer
@@ -251,12 +272,6 @@ $miExit = $menu.Items.Add('退出')
 $miExit.Add_Click({ $script:Tray.Visible = $false; $script:MainForm.Close() })
 $script:Tray.ContextMenuStrip = $menu
 $script:Tray.Add_DoubleClick({ Start-Process ($Cfg.BaseUrl + '/#me') })
-
-if (-not $Cfg.AdminPass) {
-    $script:Tray.BalloonTipTitle = '信匣通知器没配置'
-    $script:Tray.BalloonTipText = '打开 config.json，把 AdminPass 填成网站访问口令。'
-    $script:Tray.ShowBalloonTip(5000)
-}
 
 $poll = New-Object System.Windows.Forms.Timer
 $poll.Interval = $Cfg.PollSeconds * 1000
